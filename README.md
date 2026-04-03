@@ -1,7 +1,7 @@
 # badassh [WIP]
 
 
-<code>
+<pre>
 ⣿⣿⣿⣿⣿⣿⣿⣿⠟⣡⣄⠙⢿⣿⣿⣿⣿⡿⢋⣭⡙⢿⣿⣿⣿⣿⣿⣿⣿⣿
 ⣿⣿⣿⣿⣿⣿⠉⢉⣴⣿⠟⣿⣮⣩⣭⣭⣭⣐⠛⠙⢿⣆⠙⠿⣿⣿⣿⣿⣿⣿
 ⣿⣿⣿⣿⣿⣿⣦⡤⡉⢁⢸⣿⠟⠛⠿⣿⣿⣿⣿⣷⣦⣄⠡⢶⣿⣿⣿⣿⣿⣿
@@ -15,7 +15,7 @@
 ⣿⣿⡿⠋⠐⢛⠓⢰⡈⢻⣿⣿⣿⣿⣿⣿⣾⡿⡿⠿⣿⠥⢊⣴⣶⣶⣾⣿⣿⣿
 ⣿⣿⣿⣿⣿⣿⣷⣄⠙⠆⠑⢝⡻⠿⠿⠟⡿⠀⣠⣴⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿
 ⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⣄⣀⠈⠙⠒⣋⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
-</code>
+</pre>
 
 
 a badass sftp client written in rust with only cool and necessary features according to my needs
