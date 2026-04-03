@@ -82,7 +82,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         app.process_editor_uploads();
         app.poll_remote_terminals();
 
-        if event::poll(Duration::from_millis(50))? {
+        if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
@@ -127,8 +127,8 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_keyboard_shortcuts_keys(app: &mut App, key: KeyEvent) {
-    const SHORTCUTS_COUNT: usize = 48;
-    const VISIBLE_HEIGHT: usize = 35;
+    const SHORTCUTS_COUNT: usize = 49;
+    const VISIBLE_HEIGHT: usize = 38;
     
     match key.code {
         KeyCode::Esc => {
@@ -165,6 +165,19 @@ fn handle_keyboard_shortcuts_keys(app: &mut App, key: KeyEvent) {
 fn handle_terminal_keys(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
+            match app.terminal_focus {
+                TerminalFocus::LocalTerminal => {
+                    app.local_terminal_visible = false;
+                    app.local_terminal = None;
+                }
+                TerminalFocus::RemoteTerminal => {
+                    if let Some(tab) = app.tabs.get_mut(app.active_tab) {
+                        tab.remote_terminal_visible = false;
+                        tab.remote_terminal = None;
+                    }
+                }
+                TerminalFocus::None => {}
+            }
             app.terminal_focus = TerminalFocus::None;
         }
         KeyCode::Char(c) => {
@@ -333,6 +346,14 @@ fn handle_menu_focused_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => app.close_menu(),
         KeyCode::Left => app.prev_menu_tab(),
         KeyCode::Right => app.next_menu_tab(),
+        KeyCode::Tab => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                app.prev_menu_tab();
+            } else {
+                app.next_menu_tab();
+            }
+        }
+        KeyCode::BackTab => app.prev_menu_tab(),
         KeyCode::Enter | KeyCode::Down => app.open_dropdown(),
         _ => {}
     }
@@ -345,6 +366,14 @@ fn handle_menu_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Down => app.menu_down(),
         KeyCode::Left => app.prev_menu_tab(),
         KeyCode::Right => app.next_menu_tab(),
+        KeyCode::Tab => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                app.prev_menu_tab();
+            } else {
+                app.next_menu_tab();
+            }
+        }
+        KeyCode::BackTab => app.prev_menu_tab(),
         KeyCode::Enter => app.select_menu_item(),
         _ => {}
     }

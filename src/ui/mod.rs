@@ -1131,10 +1131,12 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &App) {
     
     let max_key_width = 16;
     let scroll_offset = app.shortcuts_scroll_offset;
-    let visible_count = (inner.height as usize).min(shortcuts.len());
+    let visible_height = inner.height as usize;
+    let visible_count = visible_height.min(shortcuts.len());
+    let total_items = shortcuts.len();
     
     // Draw scrollbar if needed
-    if shortcuts.len() > inner.height as usize {
+    if total_items > visible_height {
         let scrollbar_area = Rect::new(
             inner.x + inner.width - 1,
             inner.y,
@@ -1142,7 +1144,8 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &App) {
             inner.height,
         );
         
-        let mut scrollbar_state = ScrollbarState::new(shortcuts.len())
+        let max_scroll = total_items.saturating_sub(visible_height);
+        let mut scrollbar_state = ScrollbarState::new(max_scroll)
             .position(scroll_offset);
         
         frame.render_stateful_widget(

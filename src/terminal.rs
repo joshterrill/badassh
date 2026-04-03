@@ -6,7 +6,7 @@ use ssh2::{Channel, Session};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -58,6 +58,10 @@ impl TerminalScreen {
     }
 
     fn resize(&mut self, cols: usize, rows: usize) {
+        if cols == self.cols && rows == self.rows {
+            return;
+        }
+        
         self.cols = cols;
         self.rows = rows;
         self.scroll_bottom = rows.saturating_sub(1);
@@ -278,7 +282,7 @@ impl Perform for TerminalScreen {
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            0x07 => {} // Bell
+            0x07 => {}
             0x08 => self.backspace(),
             0x09 => self.tab(),
             0x0A | 0x0B | 0x0C => self.newline(),
@@ -415,14 +419,13 @@ impl Perform for TerminalScreen {
 pub struct LocalTerminal {
     #[allow(dead_code)]
     pty_pair: PtyPair,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     screen: Arc<Mutex<TerminalScreen>>,
-    #[allow(dead_code)]
-    parser: Arc<Mutex<Parser>>,
     scroll_offset: usize,
     running: Arc<AtomicBool>,
-    cols: u16,
-    rows: u16,
+    cols: Arc<AtomicU16>,
+    rows: Arc<AtomicU16>,
+    pending_resize: Arc<AtomicBool>,
 }
 
 impl LocalTerminal {
@@ -445,8 +448,18 @@ impl LocalTerminal {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         info!("Starting local terminal with shell: {} ({}x{})", shell, cols, rows);
 
+        let zdotdir = std::env::temp_dir().join("badassh-zsh");
+        let _ = std::fs::create_dir_all(&zdotdir);
+        let zshrc = zdotdir.join(".zshrc");
+        if !zshrc.exists() {
+            let _ = std::fs::write(&zshrc, "# minimal zshrc\nsetopt PROMPT_SUBST\nPS1='%~ $ '\n");
+        }
+
         let mut cmd = CommandBuilder::new(&shell);
         cmd.env("TERM", "xterm-256color");
+        if shell.contains("zsh") {
+            cmd.env("ZDOTDIR", zdotdir.to_string_lossy().to_string());
+        }
 
         if let Ok(cwd) = std::env::current_dir() {
             cmd.cwd(cwd);
@@ -461,22 +474,33 @@ impl LocalTerminal {
         let mut reader = pty_pair.master.try_clone_reader().context("Failed to get PTY reader")?;
 
         let screen = Arc::new(Mutex::new(TerminalScreen::new(cols as usize, rows as usize)));
-        let parser = Arc::new(Mutex::new(Parser::new()));
         let running = Arc::new(AtomicBool::new(true));
+        let cols_atomic = Arc::new(AtomicU16::new(cols));
+        let rows_atomic = Arc::new(AtomicU16::new(rows));
+        let pending_resize = Arc::new(AtomicBool::new(false));
 
         let screen_clone = screen.clone();
-        let parser_clone = parser.clone();
         let running_clone = running.clone();
+        let cols_clone = cols_atomic.clone();
+        let rows_clone = rows_atomic.clone();
+        let pending_resize_clone = pending_resize.clone();
 
         thread::spawn(move || {
-            let mut buf = [0u8; 8192];
+            let mut buf = [0u8; 4096];
+            let mut parser = Parser::new();
 
             while running_clone.load(Ordering::SeqCst) {
+                // Check for pending resize
+                if pending_resize_clone.swap(false, Ordering::SeqCst) {
+                    let new_cols = cols_clone.load(Ordering::SeqCst) as usize;
+                    let new_rows = rows_clone.load(Ordering::SeqCst) as usize;
+                    screen_clone.lock().resize(new_cols, new_rows);
+                }
+
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         let mut screen = screen_clone.lock();
-                        let mut parser = parser_clone.lock();
                         for byte in &buf[..n] {
                             parser.advance(&mut *screen, *byte);
                         }
@@ -486,7 +510,7 @@ impl LocalTerminal {
                             error!("Error reading from PTY: {}", e);
                             break;
                         }
-                        thread::sleep(Duration::from_millis(10));
+                        thread::sleep(Duration::from_millis(5));
                     }
                 }
             }
@@ -495,19 +519,20 @@ impl LocalTerminal {
 
         Ok(Self {
             pty_pair,
-            writer,
+            writer: Arc::new(Mutex::new(writer)),
             screen,
-            parser,
             scroll_offset: 0,
             running,
-            cols,
-            rows,
+            cols: cols_atomic,
+            rows: rows_atomic,
+            pending_resize,
         })
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.writer.write_all(data).context("Failed to write to PTY")?;
-        self.writer.flush().context("Failed to flush PTY")?;
+        let mut writer = self.writer.lock();
+        writer.write_all(data).context("Failed to write to PTY")?;
+        writer.flush().context("Failed to flush PTY")?;
         Ok(())
     }
 
@@ -543,13 +568,17 @@ impl LocalTerminal {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
-        if cols == self.cols && rows == self.rows {
+        let old_cols = self.cols.load(Ordering::SeqCst);
+        let old_rows = self.rows.load(Ordering::SeqCst);
+        
+        if cols == old_cols && rows == old_rows {
             return Ok(());
         }
         
-        self.cols = cols;
-        self.rows = rows;
-        self.screen.lock().resize(cols as usize, rows as usize);
+        self.cols.store(cols, Ordering::SeqCst);
+        self.rows.store(rows, Ordering::SeqCst);
+        self.pending_resize.store(true, Ordering::SeqCst);
+        
         self.pty_pair
             .master
             .resize(PtySize {
@@ -564,7 +593,7 @@ impl LocalTerminal {
 
     #[allow(dead_code)]
     pub fn size(&self) -> (u16, u16) {
-        (self.cols, self.rows)
+        (self.cols.load(Ordering::SeqCst), self.rows.load(Ordering::SeqCst))
     }
 }
 
@@ -599,7 +628,7 @@ impl RemoteTerminal {
         let tcp = TcpStream::connect(&addr)
             .with_context(|| format!("Failed to connect to {}", addr))?;
 
-        tcp.set_read_timeout(Some(Duration::from_millis(50)))?;
+        let tcp_clone = tcp.try_clone()?;
 
         let mut session = Session::new()?;
         session.set_tcp_stream(tcp);
@@ -642,6 +671,8 @@ impl RemoteTerminal {
             Some((cols as u32, rows as u32, 0, 0)),
         )?;
         channel.shell()?;
+        
+        tcp_clone.set_nonblocking(true)?;
         session.set_blocking(false);
 
         let screen = Arc::new(Mutex::new(TerminalScreen::new(cols as usize, rows as usize)));
@@ -660,29 +691,41 @@ impl RemoteTerminal {
     pub fn poll_read(&mut self) {
         let mut buf = [0u8; 8192];
         let mut parser = Parser::new();
+        let mut screen = self.screen.lock();
 
-        loop {
+        for _ in 0..3 {
             match self.channel.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let mut screen = self.screen.lock();
                     for byte in &buf[..n] {
                         parser.advance(&mut *screen, *byte);
                     }
                 }
-                Err(e) => {
-                    if e.kind() != std::io::ErrorKind::WouldBlock {
-                        debug!("Error reading from SSH channel: {}", e);
-                    }
-                    break;
-                }
+                Err(_) => break,
             }
         }
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.channel.write_all(data).context("Failed to write to SSH channel")?;
-        self.channel.flush().context("Failed to flush SSH channel")?;
+        self.poll_read();
+        
+        for attempt in 0..5 {
+            match self.channel.write(data) {
+                Ok(_) => {
+                    let _ = self.channel.flush();
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if attempt < 4 {
+                        self.poll_read();
+                        std::thread::sleep(Duration::from_millis(1));
+                    } else {
+                        return Err(anyhow::anyhow!("Channel busy, try again"));
+                    }
+                }
+                Err(e) => return Err(anyhow::anyhow!("Failed to write: {}", e)),
+            }
+        }
         Ok(())
     }
 
