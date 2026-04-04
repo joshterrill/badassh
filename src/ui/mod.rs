@@ -119,6 +119,7 @@ fn draw_menu_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let strip_focused = app.focus == FocusPanel::ConnectionTabs;
     let mut spans: Vec<Span> = vec![Span::styled(" ", Style::default().bg(MENU_BG))];
 
     if app.tabs.is_empty() {
@@ -128,8 +129,14 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
         ));
     } else {
         for (i, tab) in app.tabs.iter().enumerate() {
-            let is_active = i == app.active_tab;
-            let style = if is_active {
+            let is_keyboard_target = strip_focused && i == app.tab_bar_highlight;
+            let is_active_session = i == app.active_tab;
+            let style = if is_keyboard_target {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(MENU_SELECTED)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_active_session {
                 Style::default()
                     .fg(Color::Black)
                     .bg(TAB_ACTIVE)
@@ -341,7 +348,7 @@ fn draw_connections_panel(frame: &mut Frame, app: &App, area: Rect, is_focused: 
     
     if is_focused && inner.height > 2 {
         let hint = Paragraph::new(Span::styled(
-            "Enter:Connect Tab:Switch",
+            "Enter:Connect Tab:Next area",
             Style::default().fg(TEXT_DIM),
         ))
         .alignment(Alignment::Center);
@@ -888,6 +895,7 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App, main_area: Rect) {
         match app.focus {
             FocusPanel::Local => Rect::new(main_area.x, main_area.y, half_width, main_area.height),
             FocusPanel::Remote => Rect::new(main_area.x + half_width, main_area.y, main_area.width - half_width, main_area.height),
+            FocusPanel::ConnectionTabs => main_area,
         }
     };
     
@@ -1224,16 +1232,18 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         match app.mode {
             AppMode::Normal => match app.focus {
-                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex Z:Zip X:Del /:Path Tab:Switch `:Term",
-                FocusPanel::Remote => "↑↓:Nav Enter:Connect Tab:Switch",
+                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex Z:Zip X:Del /:Path Tab:Next area `:Term",
+                FocusPanel::Remote => "↑↓:Nav Enter:Connect Tab:Next area",
+                FocusPanel::ConnectionTabs => "Tab:Next area",
             },
-            AppMode::MenuFocused => "←→:Tab Enter:Select Esc:Close",
+            AppMode::MenuFocused => "←→:Menu Tab:Next area Enter:Open Esc:Close",
             AppMode::MenuOpen => "↑↓:Nav Enter:Select Esc:Close",
             AppMode::ConnectionDialog => "Tab:Next Enter:Connect Esc:Cancel",
             AppMode::ConnectionList => "↑↓:Nav Enter:Connect Esc:Close",
             AppMode::Connected => match app.focus {
-                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex U:Upload Z:Zip X:Del /:Path `:Term",
-                FocusPanel::Remote => "↑↓:Nav Enter:Open ::Filter ;:Regex D:Download Z:Zip X:Del /:Path `:Term",
+                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex U:Upload Z:Zip X:Del /:Path Tab:Next area `:Term",
+                FocusPanel::Remote => "↑↓:Nav Enter:Open ::Filter ;:Regex D:Download Z:Zip X:Del /:Path Tab:Next area `:Term",
+                FocusPanel::ConnectionTabs => "←→:Select Enter:Switch session Tab:Next area Esc:Files",
             },
             AppMode::DirectoryInput => "Tab:Complete Enter:Go Esc:Cancel",
             AppMode::DeleteConfirm => "←→:Select Enter:Confirm Esc:Cancel",

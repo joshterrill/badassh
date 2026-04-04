@@ -173,6 +173,8 @@ pub enum AppMode {
 pub enum FocusPanel {
     Local,
     Remote,
+    /// Bottom connection tab strip (keyboard selection); only used when `tabs.len() > 1`.
+    ConnectionTabs,
 }
 
 #[derive(Debug, Clone)]
@@ -923,6 +925,8 @@ pub struct App {
     pub local: LocalBrowser,
     pub tabs: Vec<ConnectionTab>,
     pub active_tab: usize,
+    /// Index highlighted when `focus == ConnectionTabs` (may differ from `active_tab` until Enter).
+    pub tab_bar_highlight: usize,
     pub next_tab_id: usize,
     pub all_connections: Vec<SavedConnection>,
     pub recent_connections: Vec<SavedConnection>,
@@ -979,6 +983,7 @@ impl App {
             local,
             tabs: Vec::new(),
             active_tab: 0,
+            tab_bar_highlight: 0,
             next_tab_id: 1,
             all_connections,
             recent_connections,
@@ -1384,6 +1389,10 @@ impl App {
             self.status_message = Some("Disconnected".to_string());
         } else {
             self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+            self.tab_bar_highlight = self.tab_bar_highlight.min(self.tabs.len() - 1);
+            if self.tabs.len() <= 1 && self.focus == FocusPanel::ConnectionTabs {
+                self.focus = FocusPanel::Local;
+            }
         }
     }
     
@@ -1413,11 +1422,96 @@ impl App {
         }
     }
     
-    pub fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            FocusPanel::Local => FocusPanel::Remote,
-            FocusPanel::Remote => FocusPanel::Local,
+    /// Tab order: menu bar → local → remote → [connection tabs when 2+ sessions] → menu bar.
+    pub fn cycle_main_focus_forward(&mut self) {
+        match self.mode {
+            AppMode::MenuFocused => {
+                self.close_menu();
+                self.focus = FocusPanel::Local;
+            }
+            AppMode::Normal => {
+                match self.focus {
+                    FocusPanel::Local => self.focus = FocusPanel::Remote,
+                    FocusPanel::Remote => self.open_file_menu(),
+                    FocusPanel::ConnectionTabs => self.focus = FocusPanel::Local,
+                }
+            }
+            AppMode::Connected => {
+                match self.focus {
+                    FocusPanel::Local => self.focus = FocusPanel::Remote,
+                    FocusPanel::Remote => {
+                        if self.tabs.len() > 1 {
+                            self.focus = FocusPanel::ConnectionTabs;
+                            self.tab_bar_highlight = self.active_tab.min(self.tabs.len() - 1);
+                        } else {
+                            self.open_file_menu();
+                        }
+                    }
+                    FocusPanel::ConnectionTabs => {
+                        self.open_file_menu();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Reverse of [`Self::cycle_main_focus_forward`].
+    pub fn cycle_main_focus_backward(&mut self) {
+        match self.mode {
+            AppMode::MenuFocused => {
+                self.close_menu();
+                if self.tabs.len() > 1 {
+                    self.focus = FocusPanel::ConnectionTabs;
+                    self.tab_bar_highlight = self.active_tab.min(self.tabs.len() - 1);
+                } else {
+                    self.focus = FocusPanel::Remote;
+                }
+            }
+            AppMode::Normal => {
+                match self.focus {
+                    FocusPanel::Local => self.open_file_menu(),
+                    FocusPanel::Remote => self.focus = FocusPanel::Local,
+                    FocusPanel::ConnectionTabs => self.focus = FocusPanel::Local,
+                }
+            }
+            AppMode::Connected => {
+                match self.focus {
+                    FocusPanel::Local => self.open_file_menu(),
+                    FocusPanel::Remote => self.focus = FocusPanel::Local,
+                    FocusPanel::ConnectionTabs => self.focus = FocusPanel::Remote,
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn tab_bar_highlight_next(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        self.tab_bar_highlight = (self.tab_bar_highlight + 1) % self.tabs.len();
+    }
+
+    pub fn tab_bar_highlight_prev(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        self.tab_bar_highlight = if self.tab_bar_highlight == 0 {
+            self.tabs.len() - 1
+        } else {
+            self.tab_bar_highlight - 1
         };
+    }
+
+    /// Applies `tab_bar_highlight` as the active connection and returns focus to the local panel.
+    pub fn activate_highlighted_connection_tab(&mut self) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        self.tab_bar_highlight = self.tab_bar_highlight.min(self.tabs.len() - 1);
+        self.active_tab = self.tab_bar_highlight;
+        self.focus = FocusPanel::Local;
     }
     
     pub fn get_current_connections(&self) -> &[SavedConnection] {
@@ -1485,7 +1579,7 @@ impl App {
     
     pub fn open_directory_input(&mut self) {
         let current_dir = match self.focus {
-            FocusPanel::Local => self.local.browser.current_dir.clone(),
+            FocusPanel::Local | FocusPanel::ConnectionTabs => self.local.browser.current_dir.clone(),
             FocusPanel::Remote => {
                 if let Some(tab) = self.current_tab() {
                     tab.browser.current_dir.clone()
@@ -1555,7 +1649,7 @@ impl App {
             (dir.to_string(), partial.to_string())
         } else {
             let current = match self.focus {
-                FocusPanel::Local => &self.local.browser.current_dir,
+                FocusPanel::Local | FocusPanel::ConnectionTabs => &self.local.browser.current_dir,
                 FocusPanel::Remote => {
                     if let Some(tab) = self.current_tab() {
                         &tab.browser.current_dir
@@ -1570,7 +1664,7 @@ impl App {
         let partial_lower = partial.to_lowercase();
         
         match self.focus {
-            FocusPanel::Local => {
+            FocusPanel::Local | FocusPanel::ConnectionTabs => {
                 let expanded_dir = if dir_path.starts_with('~') {
                     if let Some(home) = dirs::home_dir() {
                         dir_path.replacen('~', &home.to_string_lossy(), 1)
@@ -1665,7 +1759,7 @@ impl App {
         self.status_message = None;
         
         let result = match self.focus {
-            FocusPanel::Local => {
+            FocusPanel::Local | FocusPanel::ConnectionTabs => {
                 let res = LocalBrowser::change_directory(&mut self.local.browser, &path);
                 if res.is_ok() {
                     self.update_local_watcher();
@@ -1863,6 +1957,7 @@ impl App {
         match self.focus {
             FocusPanel::Local => self.zip_local_files(),
             FocusPanel::Remote => self.zip_remote_files(),
+            FocusPanel::ConnectionTabs => {}
         }
     }
     
@@ -2016,6 +2111,7 @@ impl App {
             FocusPanel::Remote => {
                 self.open_remote_files();
             }
+            FocusPanel::ConnectionTabs => {}
         }
     }
     
@@ -2138,6 +2234,7 @@ impl App {
                     }
                 }
             }
+            FocusPanel::ConnectionTabs => {}
         }
         // Clear status and error on successful navigation
         self.error_message = None;
@@ -2147,6 +2244,7 @@ impl App {
     
     pub fn show_delete_confirm(&mut self) {
         let (name, is_dir) = match self.focus {
+            FocusPanel::ConnectionTabs => return,
             FocusPanel::Local => {
                 if let Some(file) = self.local.browser.selected_file() {
                     if file.name == ".." {
@@ -2204,6 +2302,10 @@ impl App {
         let panel = match self.focus {
             FocusPanel::Local => "local",
             FocusPanel::Remote => "remote",
+            FocusPanel::ConnectionTabs => {
+                self.cancel_delete();
+                return;
+            }
         };
         info!("Deleting {} {} (is_dir: {})", panel, name, is_dir);
         
@@ -2232,6 +2334,7 @@ impl App {
                     Ok(())
                 }
             }
+            FocusPanel::ConnectionTabs => Ok(()),
         };
         
         match result {
@@ -2248,6 +2351,7 @@ impl App {
                             let _ = tab.refresh_directory();
                         }
                     }
+                    FocusPanel::ConnectionTabs => {}
                 }
             }
             Err(e) => {

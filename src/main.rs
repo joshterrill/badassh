@@ -290,24 +290,19 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Tab => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
-                match app.focus {
-                    app::FocusPanel::Remote => app.focus = app::FocusPanel::Local,
-                    app::FocusPanel::Local => app.open_file_menu(),
-                }
+                app.cycle_main_focus_backward();
             } else {
-                app.toggle_focus();
+                app.cycle_main_focus_forward();
             }
         }
         KeyCode::BackTab => {
-            match app.focus {
-                app::FocusPanel::Remote => app.focus = app::FocusPanel::Local,
-                app::FocusPanel::Local => app.open_file_menu(),
-            }
+            app.cycle_main_focus_backward();
         }
         _ => {
             match app.focus {
                 app::FocusPanel::Local => handle_file_browser_keys(app, key),
                 app::FocusPanel::Remote => handle_connections_panel_keys(app, key),
+                app::FocusPanel::ConnectionTabs => {}
             }
         }
     }
@@ -348,12 +343,12 @@ fn handle_menu_focused_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Right => app.next_menu_tab(),
         KeyCode::Tab => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
-                app.prev_menu_tab();
+                app.cycle_main_focus_backward();
             } else {
-                app.next_menu_tab();
+                app.cycle_main_focus_forward();
             }
         }
-        KeyCode::BackTab => app.prev_menu_tab(),
+        KeyCode::BackTab => app.cycle_main_focus_backward(),
         KeyCode::Enter | KeyCode::Down => app.open_dropdown(),
         _ => {}
     }
@@ -421,28 +416,42 @@ fn handle_connection_list_keys(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_connected_keys(app: &mut App, key: KeyEvent) {
+    if app.focus == FocusPanel::ConnectionTabs {
+        match key.code {
+            KeyCode::Tab => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    app.cycle_main_focus_backward();
+                } else {
+                    app.cycle_main_focus_forward();
+                }
+            }
+            KeyCode::BackTab => app.cycle_main_focus_backward(),
+            KeyCode::Left => app.tab_bar_highlight_prev(),
+            KeyCode::Right => app.tab_bar_highlight_next(),
+            KeyCode::Enter => app.activate_highlighted_connection_tab(),
+            KeyCode::Esc => app.focus = FocusPanel::Local,
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Tab => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
-                match app.focus {
-                    FocusPanel::Remote => app.focus = FocusPanel::Local,
-                    FocusPanel::Local => app.open_file_menu(),
-                }
+                app.cycle_main_focus_backward();
             } else {
-                app.toggle_focus();
+                app.cycle_main_focus_forward();
             }
         }
         KeyCode::BackTab => {
-            match app.focus {
-                FocusPanel::Remote => app.focus = FocusPanel::Local,
-                FocusPanel::Local => app.open_file_menu(),
-            }
+            app.cycle_main_focus_backward();
         }
         KeyCode::Char('/') => app.handle_slash_press(),
         _ => {
             match app.focus {
                 FocusPanel::Local => handle_local_panel_keys(app, key),
                 FocusPanel::Remote => handle_remote_panel_keys(app, key),
+                FocusPanel::ConnectionTabs => {}
             }
         }
     }
@@ -830,6 +839,8 @@ fn handle_mouse_click(app: &mut App, x: u16, y: u16, area: Rect) {
             let tab_width = tab.name.len() as u16 + 2;
             if x >= tab_x && x < tab_x + tab_width {
                 app.active_tab = i;
+                app.tab_bar_highlight = i;
+                app.focus = FocusPanel::Local;
                 app.mode = AppMode::Connected;
                 return;
             }
