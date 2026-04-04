@@ -5,19 +5,24 @@ use crate::terminal::{LocalTerminal, RemoteTerminal};
 use crate::transfer::{create_zip, SftpSessionInfo, TransferManager, TransferStatus};
 use anyhow::Result;
 use log::{info, error, debug, warn};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuTab {
     File,
     Connect,
-    Options,
     Help,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Rows in File → Settings (used for keyboard navigation).
+pub const SETTINGS_ROW_COUNT: usize = 7;
+pub const SETTINGS_ROW_EDITOR: usize = 4;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ExplorerColumns {
     pub show_size: bool,
     pub show_permissions: bool,
@@ -34,6 +39,74 @@ impl Default for ExplorerColumns {
             show_created: false,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct UserPreferences {
+    pub explorer_columns: ExplorerColumns,
+    pub editor_command: String,
+    /// When true, new or synced terminals start in the same directory as the file explorer.
+    pub open_terminal_in_explorer_dir: bool,
+    /// When true, the local file explorer tracks `cd` in the local terminal (local panel + local PTY only).
+    pub explorer_follows_terminal: bool,
+}
+
+impl UserPreferences {
+    pub fn load_from_db(db: &Database, default_editor: &str) -> Result<Self> {
+        let open_terminal_in_explorer_dir = db
+            .get_setting("open_terminal_in_explorer_dir")?
+            .as_deref()
+            .map(parse_bool_pref)
+            .unwrap_or(true);
+        let explorer_follows_terminal = db
+            .get_setting("explorer_follows_terminal")?
+            .as_deref()
+            .map(parse_bool_pref)
+            .unwrap_or(false);
+        let editor_command = db
+            .get_setting("editor_command")?
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default_editor.to_string());
+        let explorer_columns = db
+            .get_setting("explorer_columns")?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Ok(Self {
+            explorer_columns,
+            editor_command,
+            open_terminal_in_explorer_dir,
+            explorer_follows_terminal,
+        })
+    }
+
+    pub fn save_to_db(&self, db: &Database) -> Result<()> {
+        db.set_setting(
+            "open_terminal_in_explorer_dir",
+            if self.open_terminal_in_explorer_dir {
+                "1"
+            } else {
+                "0"
+            },
+        )?;
+        db.set_setting(
+            "explorer_follows_terminal",
+            if self.explorer_follows_terminal {
+                "1"
+            } else {
+                "0"
+            },
+        )?;
+        db.set_setting("editor_command", &self.editor_command)?;
+        db.set_setting(
+            "explorer_columns",
+            &serde_json::to_string(&self.explorer_columns)?,
+        )?;
+        Ok(())
+    }
+}
+
+fn parse_bool_pref(s: &str) -> bool {
+    matches!(s.to_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
 #[allow(dead_code)]
@@ -164,8 +237,7 @@ pub enum AppMode {
     Connected,
     DirectoryInput,
     DeleteConfirm,
-    ExplorerOptions,
-    EditorOptions,
+    Settings,
     KeyboardShortcuts,
 }
 
@@ -917,9 +989,12 @@ pub struct App {
     pub active_menu_tab: MenuTab,
     pub file_menu_index: usize,
     pub connect_menu_index: usize,
-    pub options_menu_index: usize,
     pub help_menu_index: usize,
     pub shortcuts_scroll_offset: usize,
+    /// Viewport height (lines) of the keyboard shortcuts dialog; updated each frame while that dialog is open.
+    pub shortcuts_viewport_height: usize,
+    /// Line count in the shortcuts help text; updated each frame while that dialog is open.
+    pub shortcuts_help_line_count: usize,
     pub connection_dialog: ConnectionDialog,
     pub db: Database,
     pub local: LocalBrowser,
@@ -941,14 +1016,16 @@ pub struct App {
     pub directory_completions: Vec<String>,
     pub directory_completion_index: usize,
     pub last_slash_press: Option<std::time::Instant>,
-    pub last_zip_press: Option<std::time::Instant>,
+    /// First `Z` of a possible `Z Z` double-press; if no second `Z` within 400ms, a normal zip runs.
+    pub zip_awaiting_second_press: Option<std::time::Instant>,
     pub pending_zip_transfer: bool,
     pub delete_confirm_yes: bool,
-    pub delete_target_name: String,
-    pub delete_target_is_dir: bool,
-    pub explorer_columns: ExplorerColumns,
-    pub explorer_options_index: usize,
-    pub editor_command: String,
+    /// Names (and dir flags) to delete when confirming; built from multi-selection or single cursor.
+    pub delete_targets: Vec<(String, bool)>,
+    pub preferences: UserPreferences,
+    pub settings_selected_index: usize,
+    pub settings_editing_editor: bool,
+    pub last_terminal_cwd_sync: Option<Instant>,
     pub local_terminal: Option<LocalTerminal>,
     pub local_terminal_visible: bool,
     pub terminal_focus: TerminalFocus,
@@ -967,6 +1044,8 @@ impl App {
         let all_connections = db.get_all_connections()?;
         let recent_connections = db.get_recent_connections(10)?;
         let local = LocalBrowser::new()?;
+        let default_editor = detect_default_editor();
+        let preferences = UserPreferences::load_from_db(&db, &default_editor)?;
         
         Ok(Self {
             running: true,
@@ -975,9 +1054,10 @@ impl App {
             active_menu_tab: MenuTab::File,
             file_menu_index: 0,
             connect_menu_index: 0,
-            options_menu_index: 0,
             help_menu_index: 0,
             shortcuts_scroll_offset: 0,
+            shortcuts_viewport_height: 1,
+            shortcuts_help_line_count: 47,
             connection_dialog: ConnectionDialog::new(),
             db,
             local,
@@ -998,14 +1078,14 @@ impl App {
             directory_completions: Vec::new(),
             directory_completion_index: 0,
             last_slash_press: None,
-            last_zip_press: None,
+            zip_awaiting_second_press: None,
             pending_zip_transfer: false,
             delete_confirm_yes: true,
-            delete_target_name: String::new(),
-            delete_target_is_dir: false,
-            explorer_columns: ExplorerColumns::default(),
-            explorer_options_index: 0,
-            editor_command: detect_default_editor(),
+            delete_targets: Vec::new(),
+            preferences,
+            settings_selected_index: 0,
+            settings_editing_editor: false,
+            last_terminal_cwd_sync: None,
             local_terminal: None,
             local_terminal_visible: false,
             terminal_focus: TerminalFocus::None,
@@ -1021,6 +1101,33 @@ impl App {
         self.mode = AppMode::MenuFocused;
     }
     
+    /// Clears Space / Shift+arrow multi-selection on the focused file panel. Returns `true` if a selection existed.
+    pub fn try_clear_file_panel_selection(&mut self) -> bool {
+        match self.focus {
+            FocusPanel::Local => {
+                if !self.local.browser.selected_indices.is_empty() {
+                    self.local.browser.clear_selection();
+                    true
+                } else {
+                    false
+                }
+            }
+            FocusPanel::Remote => {
+                if let Some(tab) = self.current_tab_mut() {
+                    if !tab.browser.selected_indices.is_empty() {
+                        tab.browser.clear_selection();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            FocusPanel::ConnectionTabs => false,
+        }
+    }
+
     pub fn open_file_menu(&mut self) {
         self.active_menu_tab = MenuTab::File;
         self.file_menu_index = 0;
@@ -1044,8 +1151,7 @@ impl App {
     pub fn next_menu_tab(&mut self) {
         self.active_menu_tab = match self.active_menu_tab {
             MenuTab::File => MenuTab::Connect,
-            MenuTab::Connect => MenuTab::Options,
-            MenuTab::Options => MenuTab::Help,
+            MenuTab::Connect => MenuTab::Help,
             MenuTab::Help => MenuTab::File,
         };
     }
@@ -1054,22 +1160,17 @@ impl App {
         self.active_menu_tab = match self.active_menu_tab {
             MenuTab::File => MenuTab::Help,
             MenuTab::Connect => MenuTab::File,
-            MenuTab::Options => MenuTab::Connect,
-            MenuTab::Help => MenuTab::Options,
+            MenuTab::Help => MenuTab::Connect,
         };
     }
     
     pub fn menu_down(&mut self) {
         match self.active_menu_tab {
             MenuTab::File => {
-                self.file_menu_index = 0;
+                self.file_menu_index = (self.file_menu_index + 1) % 2;
             }
             MenuTab::Connect => {
                 self.connect_menu_index = (self.connect_menu_index + 1) % 3;
-            }
-            MenuTab::Options => {
-                let max_items = if !self.tabs.is_empty() { 4 } else { 3 };
-                self.options_menu_index = (self.options_menu_index + 1) % max_items;
             }
             MenuTab::Help => {
                 self.help_menu_index = 0;
@@ -1080,14 +1181,14 @@ impl App {
     pub fn menu_up(&mut self) {
         match self.active_menu_tab {
             MenuTab::File => {
-                self.file_menu_index = 0;
+                self.file_menu_index = if self.file_menu_index == 0 {
+                    1
+                } else {
+                    0
+                };
             }
             MenuTab::Connect => {
                 self.connect_menu_index = if self.connect_menu_index == 0 { 2 } else { self.connect_menu_index - 1 };
-            }
-            MenuTab::Options => {
-                let max_items = if !self.tabs.is_empty() { 4 } else { 3 };
-                self.options_menu_index = if self.options_menu_index == 0 { max_items - 1 } else { self.options_menu_index - 1 };
             }
             MenuTab::Help => {
                 self.help_menu_index = 0;
@@ -1098,7 +1199,11 @@ impl App {
     pub fn select_menu_item(&mut self) {
         match self.active_menu_tab {
             MenuTab::File => {
-                self.quit();
+                match self.file_menu_index {
+                    0 => self.open_settings(),
+                    1 => self.quit(),
+                    _ => {}
+                }
             }
             MenuTab::Connect => {
                 match self.connect_menu_index {
@@ -1117,28 +1222,6 @@ impl App {
                         self.connection_list_index = 0;
                         self.refresh_connections();
                         self.mode = AppMode::ConnectionList;
-                    }
-                    _ => {}
-                }
-            }
-            MenuTab::Options => {
-                match self.options_menu_index {
-                    0 => {
-                        self.explorer_options_index = 0;
-                        self.mode = AppMode::ExplorerOptions;
-                    }
-                    1 => {
-                        self.mode = AppMode::EditorOptions;
-                    }
-                    2 => {
-                        self.toggle_local_terminal();
-                        self.close_menu();
-                    }
-                    3 => {
-                        if !self.tabs.is_empty() {
-                            self.toggle_remote_terminal();
-                        }
-                        self.close_menu();
                     }
                     _ => {}
                 }
@@ -1163,27 +1246,223 @@ impl App {
     }
     
     pub fn shortcuts_scroll_down(&mut self, max_items: usize, visible_height: usize) {
-        if max_items > visible_height {
-            let max_scroll = max_items - visible_height;
+        let vh = visible_height.max(1);
+        if max_items > vh {
+            let max_scroll = max_items - vh;
             if self.shortcuts_scroll_offset < max_scroll {
                 self.shortcuts_scroll_offset += 1;
             }
         }
     }
+
+    /// Keeps scroll offset valid when the terminal is resized or the shortcuts dialog is first shown.
+    pub fn clamp_shortcuts_scroll(&mut self) {
+        let n = self.shortcuts_help_line_count.max(1);
+        let vh = self.shortcuts_viewport_height.max(1);
+        if n > vh {
+            let max_scroll = n - vh;
+            self.shortcuts_scroll_offset = self.shortcuts_scroll_offset.min(max_scroll);
+        } else {
+            self.shortcuts_scroll_offset = 0;
+        }
+    }
+
+    /// After a single `Z`, wait 400ms for a second `Z`; otherwise run a normal zip once.
+    pub fn flush_zip_single_press(&mut self) {
+        let Some(t) = self.zip_awaiting_second_press else {
+            return;
+        };
+        if Instant::now().duration_since(t) >= Duration::from_millis(400) {
+            self.zip_awaiting_second_press = None;
+            self.pending_zip_transfer = false;
+            self.zip_selected();
+        }
+    }
     
+    fn effective_local_terminal_dir(&self) -> String {
+        if self.preferences.open_terminal_in_explorer_dir {
+            self.local.browser.current_dir.clone()
+        } else {
+            dirs::home_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "/".to_string())
+        }
+    }
+
+    fn effective_remote_terminal_dir(&self) -> String {
+        if !self.preferences.open_terminal_in_explorer_dir {
+            return "/".to_string();
+        }
+        self.current_tab()
+            .map(|t| t.browser.current_dir.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/".to_string())
+    }
+
+    pub fn open_settings(&mut self) {
+        self.settings_selected_index = 0;
+        self.settings_editing_editor = false;
+        self.mode = AppMode::Settings;
+    }
+
+    pub fn close_settings(&mut self) {
+        self.settings_editing_editor = false;
+        self.mode = if !self.tabs.is_empty() {
+            AppMode::Connected
+        } else {
+            AppMode::Normal
+        };
+    }
+
+    pub fn persist_preferences(&mut self) {
+        if let Err(e) = self.preferences.save_to_db(&self.db) {
+            error!("Failed to save settings: {}", e);
+        }
+    }
+
+    pub fn settings_move_up(&mut self) {
+        if self.settings_editing_editor {
+            return;
+        }
+        if self.settings_selected_index > 0 {
+            self.settings_selected_index -= 1;
+        }
+    }
+
+    pub fn settings_move_down(&mut self) {
+        if self.settings_editing_editor {
+            return;
+        }
+        if self.settings_selected_index + 1 < SETTINGS_ROW_COUNT {
+            self.settings_selected_index += 1;
+        }
+    }
+
+    pub fn settings_toggle_row(&mut self) {
+        if self.settings_editing_editor {
+            return;
+        }
+        match self.settings_selected_index {
+            0 => {
+                self.preferences.explorer_columns.show_size =
+                    !self.preferences.explorer_columns.show_size
+            }
+            1 => {
+                self.preferences.explorer_columns.show_permissions =
+                    !self.preferences.explorer_columns.show_permissions
+            }
+            2 => {
+                self.preferences.explorer_columns.show_modified =
+                    !self.preferences.explorer_columns.show_modified
+            }
+            3 => {
+                self.preferences.explorer_columns.show_created =
+                    !self.preferences.explorer_columns.show_created
+            }
+            4 => {
+                self.settings_begin_editor_edit();
+            }
+            5 => {
+                self.preferences.open_terminal_in_explorer_dir =
+                    !self.preferences.open_terminal_in_explorer_dir
+            }
+            6 => {
+                self.preferences.explorer_follows_terminal =
+                    !self.preferences.explorer_follows_terminal
+            }
+            _ => {}
+        }
+        if matches!(self.settings_selected_index, 0..=6) {
+            self.persist_preferences();
+        }
+    }
+
+    pub fn settings_begin_editor_edit(&mut self) {
+        if self.settings_selected_index == SETTINGS_ROW_EDITOR {
+            self.settings_editing_editor = true;
+        }
+    }
+
+    pub fn settings_finish_editor_edit(&mut self) {
+        self.settings_editing_editor = false;
+        self.persist_preferences();
+    }
+
+    pub fn settings_editor_add_char(&mut self, c: char) {
+        self.preferences.editor_command.push(c);
+    }
+
+    pub fn settings_editor_remove_char(&mut self) {
+        self.preferences.editor_command.pop();
+    }
+
+    /// Throttled sync of file explorer cwd from the visible PTY when `explorer_follows_terminal` is on:
+    /// local panel uses the local shell PID cwd; remote uses OSC 7 emitted by bash/zsh hooks in `RemoteTerminal`.
+    pub fn maybe_sync_explorers_from_terminals(&mut self) {
+        if !self.preferences.explorer_follows_terminal {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last) = self.last_terminal_cwd_sync {
+            if now.duration_since(last) < Duration::from_millis(400) {
+                return;
+            }
+        }
+        self.last_terminal_cwd_sync = Some(now);
+
+        if self.local_terminal_visible {
+            if let Some(term) = self.local_terminal.as_ref() {
+                if let Some(cwd) = term.try_shell_cwd() {
+                    if cwd.is_dir() {
+                        let cwd_str = cwd.to_string_lossy().to_string();
+                        if cwd_str != self.local.browser.current_dir {
+                            if LocalBrowser::change_directory(&mut self.local.browser, &cwd_str).is_ok() {
+                                self.update_local_watcher();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let active_tab = self.active_tab;
+        if let Some(tab) = self.tabs.get_mut(active_tab) {
+            if tab.remote_terminal_visible {
+                if let Some(cwd) = tab
+                    .remote_terminal
+                    .as_ref()
+                    .and_then(|t| t.try_reported_cwd())
+                {
+                    if cwd != tab.browser.current_dir {
+                        let _ = tab.change_directory(&cwd);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn toggle_local_terminal(&mut self) {
         self.local_terminal_visible = !self.local_terminal_visible;
         
-        if self.local_terminal_visible && self.local_terminal.is_none() {
-            match LocalTerminal::new() {
-                Ok(term) => {
-                    info!("Local terminal created");
-                    self.local_terminal = Some(term);
-                }
-                Err(e) => {
-                    error!("Failed to create local terminal: {}", e);
-                    self.error_message = Some(format!("Failed to create terminal: {}", e));
+        if self.local_terminal_visible {
+            let current_dir = self.effective_local_terminal_dir();
+            if let Some(term) = self.local_terminal.as_mut() {
+                if let Err(e) = term.set_working_dir(&current_dir) {
+                    error!("Failed to sync local terminal directory: {}", e);
+                    self.error_message = Some(format!("Failed to sync terminal directory: {}", e));
                     self.local_terminal_visible = false;
+                }
+            } else {
+                match LocalTerminal::new(&current_dir) {
+                    Ok(term) => {
+                        info!("Local terminal created");
+                        self.local_terminal = Some(term);
+                    }
+                    Err(e) => {
+                        error!("Failed to create local terminal: {}", e);
+                        self.error_message = Some(format!("Failed to create terminal: {}", e));
+                        self.local_terminal_visible = false;
+                    }
                 }
             }
         }
@@ -1196,29 +1475,60 @@ impl App {
     }
     
     pub fn toggle_remote_terminal(&mut self) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        let active_tab = self.active_tab;
+        if let Some(tab) = self.tabs.get_mut(active_tab) {
             tab.remote_terminal_visible = !tab.remote_terminal_visible;
-            
-            if tab.remote_terminal_visible && tab.remote_terminal.is_none() {
-                match RemoteTerminal::new(&tab.session_info) {
-                    Ok(term) => {
-                        info!("Remote terminal created for {}", tab.name);
-                        tab.remote_terminal = Some(term);
-                    }
-                    Err(e) => {
-                        error!("Failed to create remote terminal: {}", e);
-                        self.error_message = Some(format!("Failed to create terminal: {}", e));
-                        tab.remote_terminal_visible = false;
+        }
+
+        let visible = self
+            .tabs
+            .get(active_tab)
+            .map(|tab| tab.remote_terminal_visible)
+            .unwrap_or(false);
+
+        if visible {
+            let (session_info, tab_name) = match self.tabs.get(active_tab) {
+                Some(tab) => (tab.session_info.clone(), tab.name.clone()),
+                None => return,
+            };
+            let current_dir = self.effective_remote_terminal_dir();
+
+            let result = if let Some(tab) = self.tabs.get_mut(active_tab) {
+                if let Some(term) = tab.remote_terminal.as_mut() {
+                    term.set_working_dir(&current_dir)
+                } else {
+                    match RemoteTerminal::new(&session_info, &current_dir) {
+                        Ok(term) => {
+                            info!("Remote terminal created for {}", tab_name);
+                            tab.remote_terminal = Some(term);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
                     }
                 }
+            } else {
+                return;
+            };
+
+            if let Err(e) = result {
+                error!("Failed to open remote terminal: {}", e);
+                self.error_message = Some(format!("Failed to create terminal: {}", e));
+                if let Some(tab) = self.tabs.get_mut(active_tab) {
+                    tab.remote_terminal_visible = false;
+                }
             }
-            
-            let visible = tab.remote_terminal_visible;
-            if visible && self.focus == FocusPanel::Remote {
-                self.terminal_focus = TerminalFocus::RemoteTerminal;
-            } else if !visible && self.terminal_focus == TerminalFocus::RemoteTerminal {
-                self.terminal_focus = TerminalFocus::None;
-            }
+        }
+        
+        let visible = self
+            .tabs
+            .get(active_tab)
+            .map(|tab| tab.remote_terminal_visible)
+            .unwrap_or(false);
+
+        if visible && self.focus == FocusPanel::Remote {
+            self.terminal_focus = TerminalFocus::RemoteTerminal;
+        } else if !visible && self.terminal_focus == TerminalFocus::RemoteTerminal {
+            self.terminal_focus = TerminalFocus::None;
         }
     }
     
@@ -1937,27 +2247,26 @@ impl App {
     }
     
     pub fn handle_zip_press(&mut self) {
-        let now = std::time::Instant::now();
-        let is_double_tap = if let Some(last) = self.last_zip_press {
-            now.duration_since(last).as_millis() < 400
-        } else {
-            false
-        };
-        
-        self.last_zip_press = Some(now);
-        
-        if is_double_tap {
-            self.pending_zip_transfer = true;
+        let now = Instant::now();
+        if let Some(first) = self.zip_awaiting_second_press {
+            if now.duration_since(first) < Duration::from_millis(400) {
+                self.zip_awaiting_second_press = None;
+                self.pending_zip_transfer = true;
+                self.zip_selected();
+                return;
+            }
         }
-        
-        self.zip_selected();
+        self.zip_awaiting_second_press = Some(now);
     }
     
     pub fn zip_selected(&mut self) {
         match self.focus {
             FocusPanel::Local => self.zip_local_files(),
             FocusPanel::Remote => self.zip_remote_files(),
-            FocusPanel::ConnectionTabs => {}
+            FocusPanel::ConnectionTabs => {
+                self.zip_awaiting_second_press = None;
+                self.pending_zip_transfer = false;
+            }
         }
     }
     
@@ -1970,6 +2279,7 @@ impl App {
             .collect();
         
         if files.is_empty() {
+            self.zip_awaiting_second_press = None;
             self.pending_zip_transfer = false;
             return;
         }
@@ -1999,8 +2309,16 @@ impl App {
                 }
                 
                 if should_upload {
+                    let dest = self
+                        .tabs
+                        .get(self.active_tab)
+                        .map(|t| format!("{}@{}", t.session_info.username, t.session_info.host))
+                        .unwrap_or_else(|| "remote".to_string());
                     self.upload_selected();
-                    self.status_message = Some(format!("Created & uploading {}", zip_name));
+                    self.status_message = Some(format!(
+                        "Zipped {} → upload queued to {}",
+                        zip_name, dest
+                    ));
                 } else {
                     self.status_message = Some(format!("Created {}", zip_name));
                 }
@@ -2022,11 +2340,13 @@ impl App {
                 .collect();
             (files, tab.browser.current_dir.clone())
         } else {
+            self.zip_awaiting_second_press = None;
             self.pending_zip_transfer = false;
             return;
         };
         
         if files.is_empty() {
+            self.zip_awaiting_second_press = None;
             self.pending_zip_transfer = false;
             return;
         }
@@ -2095,8 +2415,12 @@ impl App {
         }
         
         if success && should_download {
+            let local_dir = self.local.browser.current_dir.clone();
             self.download_selected();
-            self.status_message = Some(format!("Created & downloading {}", zip_name));
+            self.status_message = Some(format!(
+                "Zipped {} → download queued to {}",
+                zip_name, local_dir
+            ));
         } else if success {
             self.status_message = Some(format!("Created {}", zip_name));
         }
@@ -2131,7 +2455,7 @@ impl App {
         }
         
         let current_dir = self.local.browser.current_dir.clone();
-        let editor_command = self.editor_command.clone();
+        let editor_command = self.preferences.editor_command.clone();
         
         for (name, _is_dir) in files {
             let path = PathBuf::from(&current_dir).join(&name);
@@ -2179,7 +2503,7 @@ impl App {
             }
         };
         
-        let editor_command = self.editor_command.clone();
+        let editor_command = self.preferences.editor_command.clone();
         
         for name in files {
             let remote_path = if current_dir.ends_with('/') {
@@ -2243,36 +2567,35 @@ impl App {
     }
     
     pub fn show_delete_confirm(&mut self) {
-        let (name, is_dir) = match self.focus {
+        let targets: Vec<(String, bool)> = match self.focus {
             FocusPanel::ConnectionTabs => return,
-            FocusPanel::Local => {
-                if let Some(file) = self.local.browser.selected_file() {
-                    if file.name == ".." {
-                        return;
-                    }
-                    (file.name.clone(), file.is_dir)
-                } else {
-                    return;
-                }
-            }
+            FocusPanel::Local => self
+                .local
+                .browser
+                .get_selected_files()
+                .iter()
+                .filter(|f| f.name != "..")
+                .map(|f| (f.name.clone(), f.is_dir))
+                .collect(),
             FocusPanel::Remote => {
                 if let Some(tab) = self.current_tab() {
-                    if let Some(file) = tab.browser.selected_file() {
-                        if file.name == ".." {
-                            return;
-                        }
-                        (file.name.clone(), file.is_dir)
-                    } else {
-                        return;
-                    }
+                    tab.browser
+                        .get_selected_files()
+                        .iter()
+                        .filter(|f| f.name != "..")
+                        .map(|f| (f.name.clone(), f.is_dir))
+                        .collect()
                 } else {
                     return;
                 }
             }
         };
-        
-        self.delete_target_name = name;
-        self.delete_target_is_dir = is_dir;
+
+        if targets.is_empty() {
+            return;
+        }
+
+        self.delete_targets = targets;
         self.delete_confirm_yes = true;
         self.mode = AppMode::DeleteConfirm;
     }
@@ -2283,7 +2606,7 @@ impl App {
         } else {
             AppMode::Normal
         };
-        self.delete_target_name.clear();
+        self.delete_targets.clear();
     }
     
     pub fn toggle_delete_option(&mut self) {
@@ -2295,10 +2618,13 @@ impl App {
             self.cancel_delete();
             return;
         }
-        
-        let name = self.delete_target_name.clone();
-        let is_dir = self.delete_target_is_dir;
-        
+
+        let targets = std::mem::take(&mut self.delete_targets);
+        if targets.is_empty() {
+            self.cancel_delete();
+            return;
+        }
+
         let panel = match self.focus {
             FocusPanel::Local => "local",
             FocusPanel::Remote => "remote",
@@ -2307,105 +2633,84 @@ impl App {
                 return;
             }
         };
-        info!("Deleting {} {} (is_dir: {})", panel, name, is_dir);
-        
-        let result: Result<(), String> = match self.focus {
+
+        let mut failures: Vec<(String, String)> = Vec::new();
+        for (name, is_dir) in &targets {
+            info!("Deleting {} \"{}\" (is_dir: {})", panel, name, is_dir);
+            let one: Result<(), String> = match self.focus {
+                FocusPanel::Local => {
+                    let path = PathBuf::from(&self.local.browser.current_dir).join(name);
+                    debug!("Local delete path: {:?}", path);
+                    if *is_dir {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    }
+                    .map_err(|e| e.to_string())
+                }
+                FocusPanel::Remote => {
+                    if let Some(tab) = self.current_tab_mut() {
+                        let remote_path = format!(
+                            "{}/{}",
+                            tab.browser.current_dir.trim_end_matches('/'),
+                            name
+                        );
+                        let cmd = if *is_dir {
+                            format!("rm -rf \"{}\"", remote_path)
+                        } else {
+                            format!("rm -f \"{}\"", remote_path)
+                        };
+                        debug!("Remote delete command: {}", cmd);
+                        tab.connection.exec(&cmd).map(|_| ()).map_err(|e| e.to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+                FocusPanel::ConnectionTabs => Ok(()),
+            };
+            if let Err(e) = one {
+                failures.push((name.clone(), e));
+            }
+        }
+
+        match self.focus {
             FocusPanel::Local => {
-                let path = PathBuf::from(&self.local.browser.current_dir).join(&name);
-                debug!("Local delete path: {:?}", path);
-                let res = if is_dir {
-                    std::fs::remove_dir_all(&path)
-                } else {
-                    std::fs::remove_file(&path)
-                };
-                res.map_err(|e| e.to_string())
+                let _ = LocalBrowser::refresh_files(&mut self.local.browser);
             }
             FocusPanel::Remote => {
                 if let Some(tab) = self.current_tab_mut() {
-                    let remote_path = format!("{}/{}", tab.browser.current_dir.trim_end_matches('/'), name);
-                    let cmd = if is_dir {
-                        format!("rm -rf \"{}\"", remote_path)
-                    } else {
-                        format!("rm -f \"{}\"", remote_path)
-                    };
-                    debug!("Remote delete command: {}", cmd);
-                    tab.connection.exec(&cmd).map(|_| ()).map_err(|e| e.to_string())
-                } else {
-                    Ok(())
+                    let _ = tab.refresh_directory();
                 }
             }
-            FocusPanel::ConnectionTabs => Ok(()),
-        };
-        
-        match result {
-            Ok(()) => {
-                info!("Delete successful: {}", name);
-                self.error_message = None;
-                self.status_message = None;
-                match self.focus {
-                    FocusPanel::Local => {
-                        let _ = LocalBrowser::refresh_files(&mut self.local.browser);
-                    }
-                    FocusPanel::Remote => {
-                        if let Some(tab) = self.current_tab_mut() {
-                            let _ = tab.refresh_directory();
-                        }
-                    }
-                    FocusPanel::ConnectionTabs => {}
-                }
-            }
-            Err(e) => {
-                error!("Delete failed: {}", e);
-                self.error_message = Some(format!("Delete failed: {}", e));
-            }
+            FocusPanel::ConnectionTabs => {}
         }
-        
+
+        let n_ok = targets.len() - failures.len();
+        if failures.is_empty() {
+            self.error_message = None;
+            self.status_message = Some(if targets.len() == 1 {
+                format!("Deleted \"{}\"", targets[0].0)
+            } else {
+                format!("Deleted {} items", targets.len())
+            });
+        } else if n_ok == 0 {
+            self.error_message = Some(format!(
+                "Delete failed: {}",
+                failures[0].1
+            ));
+            self.status_message = None;
+        } else {
+            self.error_message = Some(format!(
+                "Deleted {}, {} failed (e.g. {}: {})",
+                n_ok,
+                failures.len(),
+                failures[0].0,
+                failures[0].1
+            ));
+            self.status_message = None;
+        }
+
         self.cancel_delete();
     }
     
-    pub fn close_explorer_options(&mut self) {
-        self.mode = if !self.tabs.is_empty() {
-            AppMode::Connected
-        } else {
-            AppMode::Normal
-        };
-    }
-    
-    pub fn explorer_options_up(&mut self) {
-        if self.explorer_options_index > 0 {
-            self.explorer_options_index -= 1;
-        }
-    }
-    
-    pub fn explorer_options_down(&mut self) {
-        if self.explorer_options_index < 3 {
-            self.explorer_options_index += 1;
-        }
-    }
-    
-    pub fn toggle_explorer_option(&mut self) {
-        match self.explorer_options_index {
-            0 => self.explorer_columns.show_size = !self.explorer_columns.show_size,
-            1 => self.explorer_columns.show_permissions = !self.explorer_columns.show_permissions,
-            2 => self.explorer_columns.show_modified = !self.explorer_columns.show_modified,
-            3 => self.explorer_columns.show_created = !self.explorer_columns.show_created,
-            _ => {}
-        }
-    }
-    
-    pub fn close_editor_options(&mut self) {
-        self.mode = if !self.tabs.is_empty() {
-            AppMode::Connected
-        } else {
-            AppMode::Normal
-        };
-    }
-    
-    pub fn editor_options_add_char(&mut self, c: char) {
-        self.editor_command.push(c);
-    }
-    
-    pub fn editor_options_remove_char(&mut self) {
-        self.editor_command.pop();
-    }
 }

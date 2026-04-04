@@ -1,4 +1,7 @@
-use crate::app::{App, AppMode, DialogField, ExplorerColumns, FileBrowser, FilterMode, FocusPanel, MenuTab, TerminalFocus};
+use crate::app::{
+    App, AppMode, DialogField, ExplorerColumns, FileBrowser, FilterMode, FocusPanel, MenuTab,
+    TerminalFocus, SETTINGS_ROW_COUNT, SETTINGS_ROW_EDITOR,
+};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -40,8 +43,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         AppMode::Connected | AppMode::DirectoryInput | AppMode::DeleteConfirm => {
             draw_connected_view(frame, app, chunks[1]);
         }
-        AppMode::MenuFocused | AppMode::MenuOpen | AppMode::ExplorerOptions | 
-        AppMode::EditorOptions | AppMode::KeyboardShortcuts | AppMode::ConnectionDialog |
+        AppMode::MenuFocused | AppMode::MenuOpen | AppMode::Settings |
+        AppMode::KeyboardShortcuts | AppMode::ConnectionDialog |
         AppMode::ConnectionList => {
             if is_connected {
                 draw_connected_view(frame, app, chunks[1]);
@@ -71,12 +74,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_delete_confirm(frame, app, chunks[1]);
     }
     
-    if app.mode == AppMode::ExplorerOptions {
-        draw_explorer_options(frame, app);
-    }
-    
-    if app.mode == AppMode::EditorOptions {
-        draw_editor_options(frame, app);
+    if app.mode == AppMode::Settings {
+        draw_settings(frame, app);
     }
     
     if app.mode == AppMode::KeyboardShortcuts {
@@ -88,7 +87,6 @@ fn draw_menu_bar(frame: &mut Frame, app: &App, area: Rect) {
     let menu_items = vec![
         ("File", MenuTab::File),
         ("Connect", MenuTab::Connect),
-        ("Options", MenuTab::Options),
         ("Help", MenuTab::Help),
     ];
 
@@ -157,31 +155,19 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_dropdown_menu(frame: &mut Frame, app: &App) {
     let (items, x_offset, selected_idx): (Vec<String>, u16, usize) = match app.active_menu_tab {
-        MenuTab::File => (vec!["Exit".to_string()], 1, app.file_menu_index),
+        MenuTab::File => (
+            vec!["Settings".to_string(), "Exit".to_string()],
+            1,
+            app.file_menu_index,
+        ),
         MenuTab::Connect => (
             vec!["New Connection".to_string(), "Recent Connections".to_string(), "Show All Connections".to_string()],
             8,
             app.connect_menu_index,
         ),
-        MenuTab::Options => {
-            let local_check = if app.local_terminal_visible { "☑" } else { "☐" };
-            let remote_check = if app.is_remote_terminal_visible() { "☑" } else { "☐" };
-            
-            let mut items = vec![
-                "Explorer Options".to_string(),
-                "Editor".to_string(),
-                format!("{} Local Terminal", local_check),
-            ];
-            
-            if !app.tabs.is_empty() {
-                items.push(format!("{} Remote Terminal", remote_check));
-            }
-            
-            (items, 20, app.options_menu_index)
-        },
         MenuTab::Help => (
             vec!["Keyboard Shortcuts".to_string()],
-            30,
+            18,
             app.help_menu_index,
         ),
     };
@@ -229,7 +215,7 @@ fn draw_normal_view(frame: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(area);
     
-    let columns = app.explorer_columns;
+    let columns = app.preferences.explorer_columns;
     let in_dir_input = app.mode == AppMode::DirectoryInput && app.focus == FocusPanel::Local;
     let dir_input = if in_dir_input { Some(&app.directory_input) } else { None };
     let local_focused = app.focus == FocusPanel::Local && app.mode != AppMode::MenuOpen && app.mode != AppMode::MenuFocused;
@@ -371,7 +357,7 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
     let remote_terminal_focused = app.terminal_focus == TerminalFocus::RemoteTerminal;
     let local_focused = app.focus == FocusPanel::Local && !in_dir_input && !local_terminal_focused;
     let remote_focused = app.focus == FocusPanel::Remote && !in_dir_input && !remote_terminal_focused;
-    let columns = app.explorer_columns;
+    let columns = app.preferences.explorer_columns;
     
     let local_dir_input = if in_dir_input && app.focus == FocusPanel::Local {
         Some(&app.directory_input)
@@ -898,16 +884,33 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App, main_area: Rect) {
             FocusPanel::ConnectionTabs => main_area,
         }
     };
-    
-    let dialog_width = 40u16.min(panel_area.width.saturating_sub(4));
-    let dialog_height = 5u16;
-    
+
+    let n = app.delete_targets.len();
+    if n == 0 {
+        return;
+    }
+
+    let dialog_width = 52u16.min(panel_area.width.saturating_sub(4));
+    let body_lines: u16 = if n == 1 { 1 } else { 2 };
+    let detail_h: u16 = if n <= 1 {
+        0
+    } else if n <= 6 {
+        1
+    } else {
+        2
+    };
+    // Inner: question + optional name list + gap + button row
+    let inner_content_h = body_lines + detail_h + 1 + 1;
+    let dialog_height = (2 + inner_content_h)
+        .min(panel_area.height.saturating_sub(2))
+        .max(6);
+
     let dialog_x = panel_area.x + (panel_area.width.saturating_sub(dialog_width)) / 2;
     let dialog_y = panel_area.y + (panel_area.height.saturating_sub(dialog_height)) / 2;
-    
+
     let area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
     frame.render_widget(Clear, area);
-    
+
     let block = Block::default()
         .title(Span::styled(
             " Confirm Delete ",
@@ -916,186 +919,224 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App, main_area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ERROR))
         .style(Style::default().bg(PANEL_BG));
-    
+
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    
-    // Question text
-    let question = format!("Delete \"{}\"?", app.delete_target_name);
-    let question_para = Paragraph::new(Span::styled(
-        question,
-        Style::default().fg(TEXT),
-    ))
-    .alignment(Alignment::Center);
-    
-    let question_area = Rect::new(inner.x, inner.y, inner.width, 1);
+
+    let question = if n == 1 {
+        format!("Delete \"{}\"?", app.delete_targets[0].0)
+    } else {
+        format!("Delete {} selected items?", n)
+    };
+    let question_para = Paragraph::new(Span::styled(question, Style::default().fg(TEXT)))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+
+    let question_area = Rect::new(inner.x, inner.y, inner.width, body_lines);
     frame.render_widget(question_para, question_area);
-    
-    // Yes/No buttons
+
+    let mut btn_y = inner.y + body_lines;
+    if n > 1 {
+        let names: String = if n <= 6 {
+            app.delete_targets
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            format!(
+                "{}, … (+{} more)",
+                app.delete_targets[..4]
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                n - 4
+            )
+        };
+        let detail_para = Paragraph::new(Span::styled(names, Style::default().fg(TEXT_DIM)))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+        let detail_area = Rect::new(inner.x, btn_y, inner.width, detail_h);
+        frame.render_widget(detail_para, detail_area);
+        btn_y += detail_h;
+    }
+    btn_y += 1;
+
     let yes_style = if app.delete_confirm_yes {
         Style::default().fg(Color::Black).bg(ERROR).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(TEXT)
     };
-    
+
     let no_style = if !app.delete_confirm_yes {
         Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(TEXT)
     };
-    
+
     let buttons = Line::from(vec![
         Span::styled("  [ Yes ]  ", yes_style),
         Span::raw("    "),
         Span::styled("  [ No ]  ", no_style),
     ]);
-    
+
     let buttons_para = Paragraph::new(buttons).alignment(Alignment::Center);
-    let buttons_area = Rect::new(inner.x, inner.y + 2, inner.width, 1);
+    let buttons_area = Rect::new(inner.x, btn_y, inner.width, 1);
     frame.render_widget(buttons_para, buttons_area);
 }
 
-fn draw_explorer_options(frame: &mut Frame, app: &App) {
+fn draw_settings(frame: &mut Frame, app: &App) {
     let screen = frame.area();
-    
-    let dialog_width = 40u16.min(screen.width.saturating_sub(2));
-    let dialog_height = 10u16;
-    
+    let dialog_width = (screen.width.saturating_sub(4)).min(78);
+    let body_lines = SETTINGS_ROW_COUNT as u16;
+    let dialog_height = (body_lines + 4).min(screen.height.saturating_sub(4));
+
     let dialog_x = screen.width.saturating_sub(dialog_width) / 2;
     let dialog_y = screen.height.saturating_sub(dialog_height) / 2;
-    
+
     let area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
     frame.render_widget(Clear, area);
-    
+
     let dialog_block = Block::default()
         .title(Span::styled(
-            " File Explorer Columns ",
+            " Settings ",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(PANEL_BG));
-    
+
+    let inner = dialog_block.inner(area);
     frame.render_widget(dialog_block, area);
-    
-    let options = [
-        ("File Size", app.explorer_columns.show_size),
-        ("Permissions", app.explorer_columns.show_permissions),
-        ("Last Modified", app.explorer_columns.show_modified),
-        ("Created At", app.explorer_columns.show_created),
-    ];
-    
-    for (i, (label, checked)) in options.iter().enumerate() {
-        let is_selected = app.explorer_options_index == i;
-        let checkbox = if *checked { "[✓]" } else { "[ ]" };
-        let text = format!(" {} {} ", checkbox, label);
-        
-        let style = if is_selected {
-            Style::default().bg(MENU_SELECTED).fg(Color::Black).add_modifier(Modifier::BOLD)
+
+    let cols = app.preferences.explorer_columns;
+    let p = &app.preferences;
+
+    for i in 0..SETTINGS_ROW_COUNT {
+        let is_selected = app.settings_selected_index == i && !app.settings_editing_editor;
+        let is_editor_row = i == SETTINGS_ROW_EDITOR;
+        let editing_here = is_editor_row && app.settings_editing_editor;
+
+        let line = match i {
+            0 => format!(
+                " {} File explorer: file size column",
+                if cols.show_size { "[✓]" } else { "[ ]" }
+            ),
+            1 => format!(
+                " {} File explorer: permissions column",
+                if cols.show_permissions { "[✓]" } else { "[ ]" }
+            ),
+            2 => format!(
+                " {} File explorer: last modified column",
+                if cols.show_modified { "[✓]" } else { "[ ]" }
+            ),
+            3 => format!(
+                " {} File explorer: created column",
+                if cols.show_created { "[✓]" } else { "[ ]" }
+            ),
+            4 => {
+                let cmd = if editing_here {
+                    format!("{}█", p.editor_command)
+                } else if p.editor_command.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    p.editor_command.clone()
+                };
+                format!("    Editor command: {}", cmd)
+            }
+            5 => format!(
+                " {} Open terminal in same directory as file explorer",
+                if p.open_terminal_in_explorer_dir {
+                    "[✓]"
+                } else {
+                    "[ ]"
+                }
+            ),
+            6 => format!(
+                " {} File explorer follows terminal directory changes",
+                if p.explorer_follows_terminal {
+                    "[✓]"
+                } else {
+                    "[ ]"
+                }
+            ),
+            _ => String::new(),
+        };
+
+        let style = if editing_here {
+            Style::default().fg(Color::White).bg(INPUT_BG)
+        } else if is_selected {
+            Style::default()
+                .bg(MENU_SELECTED)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(TEXT)
         };
-        
-        let line_y = area.y + 2 + i as u16;
-        let line_area = Rect::new(area.x + 2, line_y, area.width - 4, 1);
-        let para = Paragraph::new(Span::styled(text, style));
+
+        let line_y = inner.y + 1 + i as u16;
+        let line_area = Rect::new(inner.x + 1, line_y, inner.width.saturating_sub(2), 1);
+        let para = Paragraph::new(Span::styled(
+            if line.len() > inner.width.saturating_sub(2) as usize {
+                let max = inner.width.saturating_sub(5) as usize;
+                format!("{}…", line.chars().take(max).collect::<String>())
+            } else {
+                line
+            },
+            style,
+        ));
         frame.render_widget(para, line_area);
     }
-    
-    // Hint at the bottom
+
     let hint = Paragraph::new(Span::styled(
-        " ↑↓:Nav Space:Toggle Esc:Close ",
+        " ↑↓ Tab:Next row Enter:Edit editor Space:Toggle Esc:Close ",
         Style::default().fg(TEXT_DIM),
     ))
     .alignment(Alignment::Center);
-    let hint_area = Rect::new(area.x, area.y + dialog_height - 2, area.width, 1);
-    frame.render_widget(hint, hint_area);
+    let hint_y = area.y + dialog_height.saturating_sub(2);
+    frame.render_widget(
+        hint,
+        Rect::new(area.x, hint_y, area.width, 1),
+    );
 }
 
-fn draw_editor_options(frame: &mut Frame, app: &App) {
+fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
-    
-    let dialog_width = 50u16.min(screen.width.saturating_sub(2));
-    let dialog_height = 8u16;
-    
+
+    let dialog_width = 76u16.min(screen.width.saturating_sub(4));
+    let dialog_height = 26u16
+        .min(screen.height.saturating_sub(6))
+        .max(14);
+
     let dialog_x = screen.width.saturating_sub(dialog_width) / 2;
     let dialog_y = screen.height.saturating_sub(dialog_height) / 2;
-    
+
     let area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
     frame.render_widget(Clear, area);
-    
+
     let dialog_block = Block::default()
         .title(Span::styled(
-            " Editor Command ",
+            " Shortcuts ",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(PANEL_BG));
-    
-    frame.render_widget(dialog_block, area);
-    
-    // Label
-    let label = Paragraph::new(Span::styled(
-        "Command to open files with:",
-        Style::default().fg(TEXT),
-    ));
-    let label_area = Rect::new(area.x + 2, area.y + 2, area.width - 4, 1);
-    frame.render_widget(label, label_area);
-    
-    // Input field
-    let input_text = format!("{}█", app.editor_command);
-    let input = Paragraph::new(Span::styled(
-        input_text,
-        Style::default().fg(Color::White).bg(INPUT_BG),
-    ));
-    let input_area = Rect::new(area.x + 2, area.y + 3, area.width - 4, 1);
-    frame.render_widget(input, input_area);
-    
-    // Hint at the bottom
-    let hint = Paragraph::new(Span::styled(
-        " Type command (e.g. code, vim, nano) | Esc:Close ",
-        Style::default().fg(TEXT_DIM),
-    ))
-    .alignment(Alignment::Center);
-    let hint_area = Rect::new(area.x, area.y + dialog_height - 2, area.width, 1);
-    frame.render_widget(hint, hint_area);
-}
 
-fn draw_keyboard_shortcuts(frame: &mut Frame, app: &App) {
-    let screen = frame.area();
-    
-    let dialog_width = 70u16.min(screen.width.saturating_sub(4));
-    let dialog_height = 40u16.min(screen.height.saturating_sub(4));
-    
-    let dialog_x = screen.width.saturating_sub(dialog_width) / 2;
-    let dialog_y = screen.height.saturating_sub(dialog_height) / 2;
-    
-    let area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
-    frame.render_widget(Clear, area);
-    
-    let dialog_block = Block::default()
-        .title(Span::styled(
-            " Keyboard Shortcuts (↑↓ to scroll) ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(PANEL_BG));
-    
     let inner = dialog_block.inner(area);
     frame.render_widget(dialog_block, area);
     
     let shortcuts = vec![
         ("", "── Navigation ──"),
         ("↑/↓", "Move selection up/down"),
-        ("Ctrl+Y/Ctrl+V", "Page up/down in file explorer"),
+        ("Ctrl+Y/Ctrl+V", "Page up/down (explorer & scrollable dialogs)"),
         ("Tab", "Switch panel (local ↔ remote/connections)"),
         ("Shift+Tab", "Switch to previous panel or menu"),
         ("Enter", "Open file/folder or connect"),
         ("/", "Edit current path (Tab to autocomplete)"),
         ("/ /", "Double-tap to start from root (/)"),
-        ("Esc", "Close dialog or focus menu"),
+        ("Esc", "Clear file selection if any; else menu / close dialog"),
         ("", ""),
         ("", "── Selection ──"),
         ("Space", "Toggle selection of current item"),
@@ -1105,8 +1146,8 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &App) {
         ("D", "Download selected (remote panel)"),
         ("U", "Upload selected (local panel)"),
         ("Z", "Zip selected files/folders"),
-        ("Z Z", "Zip and auto-transfer (upload/download)"),
-        ("X", "Delete selected files/folders"),
+        ("Z Z", "Zip selection, then queue upload (local) or download (remote)"),
+        ("X", "Delete all selected files/folders"),
         ("", ""),
         ("", "── Filtering ──"),
         (":", "Start text filter"),
@@ -1118,11 +1159,8 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &App) {
         ("←/→", "Navigate menu tabs"),
         ("Enter/↓", "Open menu dropdown"),
         ("", ""),
-        ("", "── Options Menu ──"),
-        ("Explorer Options", "Configure visible columns"),
-        ("Editor", "Set default editor command"),
-        ("Local Terminal", "Toggle local terminal panel"),
-        ("Remote Terminal", "Toggle remote terminal panel"),
+        ("", "── Settings ──"),
+        ("File → Settings", "Columns, editor, terminal cwd options"),
         ("", ""),
         ("", "── Terminal ──"),
         ("`", "Toggle and focus terminal"),
@@ -1132,66 +1170,75 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &App) {
         ("", ""),
         ("", "── This Dialog ──"),
         ("↑↓/j k", "Scroll shortcuts"),
-        ("PgUp/PgDn", "Scroll fast"),
+        ("Ctrl+Y/Ctrl+V", "Page up/down"),
+        ("PgUp/PgDn", "Page up/down"),
         ("Home/End", "Jump to start/end"),
         ("Esc", "Close"),
     ];
     
-    let max_key_width = 16;
-    let scroll_offset = app.shortcuts_scroll_offset;
-    let visible_height = inner.height as usize;
-    let visible_count = visible_height.min(shortcuts.len());
     let total_items = shortcuts.len();
-    
-    // Draw scrollbar if needed
+    app.shortcuts_help_line_count = total_items;
+    let visible_height = inner.height as usize;
+    app.shortcuts_viewport_height = visible_height.max(1);
+    app.clamp_shortcuts_scroll();
+    let scroll_offset = app.shortcuts_scroll_offset;
+
+    let max_key_width = 14;
+    let text_width = inner.width.saturating_sub(3);
+
     if total_items > visible_height {
-        let scrollbar_area = Rect::new(
-            inner.x + inner.width - 1,
-            inner.y,
-            1,
-            inner.height,
-        );
-        
+        // Ratatui's thumb reaches the end only when position == content_length - 1; it uses
+        // end = position + viewport in the denominator. Our scroll model uses first-line index
+        // (max total - visible), so map linearly into 0..=total_items-1.
         let max_scroll = total_items.saturating_sub(visible_height);
-        let mut scrollbar_state = ScrollbarState::new(max_scroll)
-            .position(scroll_offset);
-        
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(Some("▲"))
-                .end_symbol(Some("▼"))
-                .track_symbol(Some("│"))
-                .thumb_symbol("█"),
-            scrollbar_area,
-            &mut scrollbar_state,
-        );
+        let scrollbar_position = if max_scroll == 0 {
+            0
+        } else {
+            scroll_offset.saturating_mul(total_items.saturating_sub(1)) / max_scroll
+        };
+
+        let scrollbar_area = Rect::new(inner.x + inner.width - 1, inner.y, 1, inner.height);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"))
+            .track_symbol(Some("│"))
+            .thumb_symbol("█");
+
+        let mut scrollbar_state = ScrollbarState::new(total_items)
+            .position(scrollbar_position)
+            .viewport_content_length(visible_height.max(1));
+
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
-    
-    for (i, (key, desc)) in shortcuts.iter().skip(scroll_offset).take(visible_count).enumerate() {
+
+    for (i, (key, desc)) in shortcuts
+        .iter()
+        .skip(scroll_offset)
+        .take(visible_height)
+        .enumerate()
+    {
         let y = inner.y + i as u16;
-        
+
         if key.is_empty() {
-            // Section header or empty line
             let style = if desc.starts_with("──") {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(TEXT_DIM)
             };
             let text = Paragraph::new(Span::styled(*desc, style));
-            let text_area = Rect::new(inner.x + 2, y, inner.width - 6, 1);
+            let text_area = Rect::new(inner.x + 1, y, text_width, 1);
             frame.render_widget(text, text_area);
         } else {
-            // Key-description pair
             let key_span = Span::styled(
                 format!("{:>width$}", key, width = max_key_width),
                 Style::default().fg(MENU_SELECTED).add_modifier(Modifier::BOLD),
             );
-            let sep_span = Span::styled("  ", Style::default());
+            let sep_span = Span::styled(" ", Style::default());
             let desc_span = Span::styled(*desc, Style::default().fg(TEXT));
-            
+
             let line = Line::from(vec![key_span, sep_span, desc_span]);
             let text = Paragraph::new(line);
-            let text_area = Rect::new(inner.x + 2, y, inner.width - 6, 1);
+            let text_area = Rect::new(inner.x + 1, y, text_width, 1);
             frame.render_widget(text, text_area);
         }
     }
@@ -1247,9 +1294,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             },
             AppMode::DirectoryInput => "Tab:Complete Enter:Go Esc:Cancel",
             AppMode::DeleteConfirm => "←→:Select Enter:Confirm Esc:Cancel",
-            AppMode::ExplorerOptions => "↑↓:Nav Space:Toggle Esc:Close",
-            AppMode::EditorOptions => "Type command | Esc:Close",
-            AppMode::KeyboardShortcuts => "Esc:Close",
+            AppMode::Settings => "↑↓ Space:Toggle Enter:Edit editor Esc:Close",
+            AppMode::KeyboardShortcuts => "↑↓ j/k Ctrl+Y/V PgUp/Dn Home/End Esc:Close",
         }
     };
 

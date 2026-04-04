@@ -7,7 +7,9 @@ mod transfer;
 mod ui;
 
 use anyhow::Result;
-use app::{App, AppMode, ConnectionDialog, FilterMode, FocusPanel, TerminalFocus};
+use app::{
+    App, AppMode, ConnectionDialog, FilterMode, FocusPanel, TerminalFocus, SETTINGS_ROW_EDITOR,
+};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
     execute,
@@ -81,6 +83,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
         app.check_local_directory_changes();
         app.process_editor_uploads();
         app.poll_remote_terminals();
+        app.maybe_sync_explorers_from_terminals();
+        app.flush_zip_single_press();
 
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
@@ -120,16 +124,14 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
         AppMode::Connected => handle_connected_keys(app, key),
         AppMode::DirectoryInput => handle_directory_input_keys(app, key),
         AppMode::DeleteConfirm => handle_delete_confirm_keys(app, key),
-        AppMode::ExplorerOptions => handle_explorer_options_keys(app, key),
-        AppMode::EditorOptions => handle_editor_options_keys(app, key),
+        AppMode::Settings => handle_settings_keys(app, key),
         AppMode::KeyboardShortcuts => handle_keyboard_shortcuts_keys(app, key),
     }
 }
 
 fn handle_keyboard_shortcuts_keys(app: &mut App, key: KeyEvent) {
-    const SHORTCUTS_COUNT: usize = 49;
-    const VISIBLE_HEIGHT: usize = 38;
-    
+    let vh = app.shortcuts_viewport_height.max(1);
+    let lines = app.shortcuts_help_line_count.max(1);
     match key.code {
         KeyCode::Esc => {
             app.close_keyboard_shortcuts();
@@ -138,24 +140,38 @@ fn handle_keyboard_shortcuts_keys(app: &mut App, key: KeyEvent) {
             app.shortcuts_scroll_up();
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.shortcuts_scroll_down(SHORTCUTS_COUNT, VISIBLE_HEIGHT);
+            app.shortcuts_scroll_down(lines, vh);
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            for _ in 0..vh {
+                app.shortcuts_scroll_up();
+            }
+        }
+        KeyCode::Char('v') | KeyCode::Char('V')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            for _ in 0..vh {
+                app.shortcuts_scroll_down(lines, vh);
+            }
         }
         KeyCode::PageUp => {
-            for _ in 0..10 {
+            for _ in 0..vh {
                 app.shortcuts_scroll_up();
             }
         }
         KeyCode::PageDown => {
-            for _ in 0..10 {
-                app.shortcuts_scroll_down(SHORTCUTS_COUNT, VISIBLE_HEIGHT);
+            for _ in 0..vh {
+                app.shortcuts_scroll_down(lines, vh);
             }
         }
         KeyCode::Home => {
             app.shortcuts_scroll_offset = 0;
         }
         KeyCode::End => {
-            if SHORTCUTS_COUNT > VISIBLE_HEIGHT {
-                app.shortcuts_scroll_offset = SHORTCUTS_COUNT - VISIBLE_HEIGHT;
+            if lines > vh {
+                app.shortcuts_scroll_offset = lines - vh;
             }
         }
         _ => {}
@@ -491,34 +507,53 @@ fn handle_delete_confirm_keys(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_explorer_options_keys(app: &mut App, key: KeyEvent) {
+fn handle_settings_keys(app: &mut App, key: KeyEvent) {
+    if app.settings_editing_editor {
+        match key.code {
+            KeyCode::Esc => {
+                app.settings_finish_editor_edit();
+            }
+            KeyCode::Enter => {
+                app.settings_finish_editor_edit();
+            }
+            KeyCode::Backspace => {
+                app.settings_editor_remove_char();
+            }
+            KeyCode::Char(c) => {
+                app.settings_editor_add_char(c);
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Esc => {
-            app.close_explorer_options();
+            app.close_settings();
         }
         KeyCode::Up => {
-            app.explorer_options_up();
+            app.settings_move_up();
         }
         KeyCode::Down => {
-            app.explorer_options_down();
+            app.settings_move_down();
         }
-        KeyCode::Char(' ') | KeyCode::Enter => {
-            app.toggle_explorer_option();
+        KeyCode::Tab => {
+            if app.settings_selected_index + 1 < app::SETTINGS_ROW_COUNT {
+                app.settings_selected_index += 1;
+            }
         }
-        _ => {}
-    }
-}
-
-fn handle_editor_options_keys(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => {
-            app.close_editor_options();
+        KeyCode::BackTab => {
+            app.settings_move_up();
         }
-        KeyCode::Backspace => {
-            app.editor_options_remove_char();
+        KeyCode::Char(' ') => {
+            app.settings_toggle_row();
         }
-        KeyCode::Char(c) => {
-            app.editor_options_add_char(c);
+        KeyCode::Enter => {
+            if app.settings_selected_index == SETTINGS_ROW_EDITOR {
+                app.settings_begin_editor_edit();
+            } else {
+                app.settings_toggle_row();
+            }
         }
         _ => {}
     }
@@ -557,7 +592,11 @@ fn handle_local_panel_keys(app: &mut App, key: KeyEvent) {
     }
     
     match key.code {
-        KeyCode::Esc => app.open_file_menu(),
+        KeyCode::Esc => {
+            if !app.try_clear_file_panel_selection() {
+                app.open_file_menu();
+            }
+        }
         KeyCode::Char(':') => app.local.browser.start_filter(FilterMode::Normal),
         KeyCode::Char(';') => app.local.browser.start_filter(FilterMode::Regex),
         KeyCode::Up => {
@@ -644,7 +683,11 @@ fn handle_remote_panel_keys(app: &mut App, key: KeyEvent) {
     }
     
     match key.code {
-        KeyCode::Esc => app.open_file_menu(),
+        KeyCode::Esc => {
+            if !app.try_clear_file_panel_selection() {
+                app.open_file_menu();
+            }
+        }
         KeyCode::Char(':') => {
             if let Some(tab) = app.current_tab_mut() {
                 tab.browser.start_filter(FilterMode::Normal);
@@ -737,7 +780,11 @@ fn handle_file_browser_keys(app: &mut App, key: KeyEvent) {
     }
     
     match key.code {
-        KeyCode::Esc => app.open_file_menu(),
+        KeyCode::Esc => {
+            if !app.try_clear_file_panel_selection() {
+                app.open_file_menu();
+            }
+        }
         KeyCode::Char('/') => app.handle_slash_press(),
         KeyCode::Char(':') => app.local.browser.start_filter(FilterMode::Normal),
         KeyCode::Char(';') => app.local.browser.start_filter(FilterMode::Regex),
@@ -786,7 +833,7 @@ fn handle_mouse_click(app: &mut App, x: u16, y: u16, area: Rect) {
             }
             return;
         }
-        if x < 17 {
+        if x < 18 {
             if app.mode == AppMode::MenuOpen && app.active_menu_tab == app::MenuTab::Connect {
                 app.close_menu();
             } else {
@@ -795,19 +842,30 @@ fn handle_mouse_click(app: &mut App, x: u16, y: u16, area: Rect) {
             }
             return;
         }
+        if app.mode == AppMode::MenuOpen && app.active_menu_tab == app::MenuTab::Help {
+            app.close_menu();
+        } else {
+            app.active_menu_tab = app::MenuTab::Help;
+            app.mode = AppMode::MenuOpen;
+        }
+        return;
     }
 
     if app.mode == AppMode::MenuOpen {
         match app.active_menu_tab {
             app::MenuTab::File => {
-                if x >= 1 && x < 12 && y >= 1 && y <= 2 {
-                    app.select_menu_item();
-                    return;
+                if x >= 1 && x < 24 && y >= 2 && y <= 3 {
+                    let item_index = (y - 2) as usize;
+                    if item_index < 2 {
+                        app.file_menu_index = item_index;
+                        app.select_menu_item();
+                        return;
+                    }
                 }
             }
             app::MenuTab::Connect => {
-                if x >= 8 && x < 30 && y >= 1 && y <= 4 {
-                    let item_index = (y - 1) as usize;
+                if x >= 8 && x < 30 && y >= 2 && y <= 4 {
+                    let item_index = (y - 2) as usize;
                     if item_index < 3 {
                         app.connect_menu_index = item_index;
                         app.select_menu_item();
@@ -815,14 +873,8 @@ fn handle_mouse_click(app: &mut App, x: u16, y: u16, area: Rect) {
                     }
                 }
             }
-            app::MenuTab::Options => {
-                if x >= 20 && x < 40 && y >= 1 && y <= 2 {
-                    app.select_menu_item();
-                    return;
-                }
-            }
             app::MenuTab::Help => {
-                if x >= 30 && x < 50 && y >= 1 && y <= 2 {
+                if x >= 18 && x < 62 && y >= 2 && y <= 2 {
                     app.select_menu_item();
                     return;
                 }

@@ -22,6 +22,15 @@ a badass sftp client written in rust with only cool and necessary features accor
 
 Actively under development and likely unstable.
 
+## Features
+
+- Hacker-like terminal UI
+- Nifty, easy-to-remember, keyboard shortcuts
+- Multi-threaded downloading and uploading
+- Integrated terminal with cool optional features like having file explorer follow your directory changes
+- Easily zip files with `z` or zip and download/upload with `zz`
+- ???
+
 ## Install
 
 Binary downloads are available from the [releases page](https://github.com/joshterrill/badassh/releases).

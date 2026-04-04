@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use log::{debug, error, info};
 use parking_lot::Mutex;
-use portable_pty::{native_pty_system, CommandBuilder, PtyPair, PtySize};
+use portable_pty::{native_pty_system, Child, CommandBuilder, PtyPair, PtySize};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
 use ssh2::{Channel, Session};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -14,9 +15,77 @@ use vte::{Params, Parser, Perform};
 
 use crate::transfer::SftpSessionInfo;
 
+/// Decode minimal `%XX` sequences in a path from an OSC 7 `file:` URI.
+fn percent_decode_path(mut s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    while let Some(i) = s.find('%') {
+        out.push_str(&s[..i]);
+        s = &s[i + 1..];
+        let b = s.as_bytes();
+        if b.len() >= 2 {
+            if let (Some(hi), Some(lo)) = (hex_nibble(b[0]), hex_nibble(b[1])) {
+                out.push(char::from((hi << 4) | lo));
+                s = &s[2..];
+                continue;
+            }
+        }
+        out.push('%');
+    }
+    out.push_str(s);
+    out
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Path from OSC 7 payload `file://host/path` or `file:///path`.
+fn path_from_osc7_file_uri(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let path = if rest.starts_with('/') {
+        rest
+    } else {
+        let slash = rest.find('/')?;
+        &rest[slash..]
+    };
+    let path = percent_decode_path(path);
+    if path.starts_with('/') && !path.is_empty() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 const MAX_SCROLLBACK: usize = 5000;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
+
+fn shell_cwd_from_pid(pid: u32) -> Option<PathBuf> {
+    let mut sys = System::new_with_specifics(
+        RefreshKind::new().with_processes(ProcessRefreshKind::new().with_cwd(UpdateKind::Always)),
+    );
+    let p = Pid::from_u32(pid);
+    sys.refresh_processes(ProcessesToUpdate::Some(&[p]), true);
+    sys.process(p)?.cwd().map(|c| c.to_path_buf())
+}
+
+fn shell_escape(value: &str) -> String {
+    value.replace('\'', "'\"'\"'")
+}
+
+fn shell_cd_command(dir: &str) -> String {
+    // Disable zsh PROMPT_SP before cd so a lone "%" is not left when our VT parser
+    // does not fully match prompt drawing (same issue as local minimal zshrc).
+    format!(
+        "[ -n \"${{ZSH_VERSION:-}}\" ] && unsetopt promptsp 2>/dev/null; cd -- '{}'\r",
+        shell_escape(dir)
+    )
+}
 
 #[derive(Clone)]
 struct ScreenCell {
@@ -39,6 +108,8 @@ struct TerminalScreen {
     scroll_top: usize,
     scroll_bottom: usize,
     saved_cursor: Option<(usize, usize)>,
+    /// Latest OSC 7 `file://…` path from the shell (remote cwd reporting).
+    last_reported_cwd: Option<String>,
 }
 
 impl TerminalScreen {
@@ -54,6 +125,7 @@ impl TerminalScreen {
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             saved_cursor: None,
+            last_reported_cwd: None,
         }
     }
 
@@ -294,7 +366,17 @@ impl Perform for TerminalScreen {
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.len() < 2 || params[0] != b"7" {
+            return;
+        }
+        let Ok(uri) = std::str::from_utf8(params[1]) else {
+            return;
+        };
+        if let Some(path) = path_from_osc7_file_uri(uri) {
+            self.last_reported_cwd = Some(path);
+        }
+    }
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
         match byte {
             b'7' => self.saved_cursor = Some((self.cursor_x, self.cursor_y)),
@@ -419,6 +501,8 @@ impl Perform for TerminalScreen {
 pub struct LocalTerminal {
     #[allow(dead_code)]
     pty_pair: PtyPair,
+    /// Kept alive so the shell session stays running; also used to read its cwd for explorer sync.
+    _child: Box<dyn Child + Send + Sync>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     screen: Arc<Mutex<TerminalScreen>>,
     scroll_offset: usize,
@@ -429,11 +513,11 @@ pub struct LocalTerminal {
 }
 
 impl LocalTerminal {
-    pub fn new() -> Result<Self> {
-        Self::new_with_size(DEFAULT_COLS, DEFAULT_ROWS)
+    pub fn new(initial_dir: &str) -> Result<Self> {
+        Self::new_with_size(initial_dir, DEFAULT_COLS, DEFAULT_ROWS)
     }
 
-    pub fn new_with_size(cols: u16, rows: u16) -> Result<Self> {
+    pub fn new_with_size(initial_dir: &str, cols: u16, rows: u16) -> Result<Self> {
         let pty_system = native_pty_system();
 
         let pty_pair = pty_system
@@ -451,9 +535,12 @@ impl LocalTerminal {
         let zdotdir = std::env::temp_dir().join("badassh-zsh");
         let _ = std::fs::create_dir_all(&zdotdir);
         let zshrc = zdotdir.join(".zshrc");
-        if !zshrc.exists() {
-            let _ = std::fs::write(&zshrc, "# minimal zshrc\nsetopt PROMPT_SUBST\nPS1='%~ $ '\n");
-        }
+        // PROMPT_SP prints "%" then pads + CR so the prompt overwrites it; our emulator
+        // often leaves "%" visible when CSI sequences move the cursor before prompt text.
+        let _ = std::fs::write(
+            &zshrc,
+            "# minimal zshrc\nunsetopt promptsp\nsetopt PROMPT_SUBST\nPS1='%~ $ '\n",
+        );
 
         let mut cmd = CommandBuilder::new(&shell);
         cmd.env("TERM", "xterm-256color");
@@ -461,11 +548,9 @@ impl LocalTerminal {
             cmd.env("ZDOTDIR", zdotdir.to_string_lossy().to_string());
         }
 
-        if let Ok(cwd) = std::env::current_dir() {
-            cmd.cwd(cwd);
-        }
+        cmd.cwd(PathBuf::from(initial_dir));
 
-        let _child = pty_pair
+        let child = pty_pair
             .slave
             .spawn_command(cmd)
             .context("Failed to spawn shell")?;
@@ -519,6 +604,7 @@ impl LocalTerminal {
 
         Ok(Self {
             pty_pair,
+            _child: child,
             writer: Arc::new(Mutex::new(writer)),
             screen,
             scroll_offset: 0,
@@ -527,6 +613,16 @@ impl LocalTerminal {
             rows: rows_atomic,
             pending_resize,
         })
+    }
+
+    pub fn shell_process_id(&self) -> Option<u32> {
+        self._child.process_id()
+    }
+
+    /// Current working directory of the shell process, when the OS exposes it (used for local explorer sync).
+    pub fn try_shell_cwd(&self) -> Option<PathBuf> {
+        let pid = self.shell_process_id()?;
+        shell_cwd_from_pid(pid)
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
@@ -538,6 +634,10 @@ impl LocalTerminal {
 
     pub fn send_key(&mut self, key: &str) -> Result<()> {
         self.write(key.as_bytes())
+    }
+
+    pub fn set_working_dir(&mut self, dir: &str) -> Result<()> {
+        self.write(shell_cd_command(dir).as_bytes())
     }
 
     pub fn get_visible_lines(&self, height: usize) -> Vec<String> {
@@ -606,6 +706,8 @@ impl Drop for LocalTerminal {
 pub struct RemoteTerminal {
     channel: Channel,
     screen: Arc<Mutex<TerminalScreen>>,
+    /// Must persist across `poll_read` calls so OSC sequences can span TCP chunks.
+    parser: Parser,
     scroll_offset: usize,
     #[allow(dead_code)]
     running: Arc<AtomicBool>,
@@ -614,11 +716,16 @@ pub struct RemoteTerminal {
 }
 
 impl RemoteTerminal {
-    pub fn new(session_info: &SftpSessionInfo) -> Result<Self> {
-        Self::new_with_size(session_info, DEFAULT_COLS, DEFAULT_ROWS)
+    pub fn new(session_info: &SftpSessionInfo, initial_dir: &str) -> Result<Self> {
+        Self::new_with_size(session_info, initial_dir, DEFAULT_COLS, DEFAULT_ROWS)
     }
 
-    pub fn new_with_size(session_info: &SftpSessionInfo, cols: u16, rows: u16) -> Result<Self> {
+    pub fn new_with_size(
+        session_info: &SftpSessionInfo,
+        initial_dir: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self> {
         info!(
             "Creating remote terminal for {}@{} ({}x{})",
             session_info.username, session_info.host, cols, rows
@@ -678,19 +785,31 @@ impl RemoteTerminal {
         let screen = Arc::new(Mutex::new(TerminalScreen::new(cols as usize, rows as usize)));
         let running = Arc::new(AtomicBool::new(true));
 
-        Ok(Self {
+        let mut terminal = Self {
             channel,
             screen,
+            parser: Parser::new(),
             scroll_offset: 0,
             running,
             cols,
             rows,
-        })
+        };
+        terminal.inject_remote_cwd_hooks()?;
+        terminal.set_working_dir(initial_dir)?;
+        terminal.write(b"__badassh_cwd\r")?;
+        Ok(terminal)
+    }
+
+    /// bash/zsh hooks that emit OSC 7 before each prompt so we can sync the remote file explorer.
+    fn inject_remote_cwd_hooks(&mut self) -> Result<()> {
+        const HOOK: &[u8] = b"__badassh_cwd(){ printf '\\033]7;file://%s%s\\a' \"${HOSTNAME:-localhost}\" \"$(printf %s \"$PWD\" | sed 's/ /%20/g')\"; }; [ -n \"${ZSH_VERSION:-}\" ] && precmd_functions+=(__badassh_cwd); [ -n \"${BASH_VERSION:-}\" ] && PROMPT_COMMAND=\"__badassh_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\";";
+        self.write(HOOK)?;
+        self.write(b"\r")?;
+        Ok(())
     }
 
     pub fn poll_read(&mut self) {
         let mut buf = [0u8; 8192];
-        let mut parser = Parser::new();
         let mut screen = self.screen.lock();
 
         for _ in 0..3 {
@@ -698,12 +817,17 @@ impl RemoteTerminal {
                 Ok(0) => break,
                 Ok(n) => {
                     for byte in &buf[..n] {
-                        parser.advance(&mut *screen, *byte);
+                        self.parser.advance(&mut *screen, *byte);
                     }
                 }
                 Err(_) => break,
             }
         }
+    }
+
+    /// Latest absolute path reported by the remote shell via OSC 7 (see `inject_remote_cwd_hooks`).
+    pub fn try_reported_cwd(&self) -> Option<String> {
+        self.screen.lock().last_reported_cwd.clone()
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
@@ -731,6 +855,10 @@ impl RemoteTerminal {
 
     pub fn send_key(&mut self, key: &str) -> Result<()> {
         self.write(key.as_bytes())
+    }
+
+    pub fn set_working_dir(&mut self, dir: &str) -> Result<()> {
+        self.write(shell_cd_command(dir).as_bytes())
     }
 
     pub fn get_visible_lines(&self, height: usize) -> Vec<String> {
