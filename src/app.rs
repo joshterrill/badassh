@@ -7,7 +7,7 @@ use anyhow::Result;
 use log::{info, error, debug, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -236,6 +236,7 @@ pub enum AppMode {
     ConnectionList,
     Connected,
     DirectoryInput,
+    RenameInput,
     DeleteConfirm,
     Settings,
     KeyboardShortcuts,
@@ -501,6 +502,18 @@ impl FileBrowser {
                 .filter_map(|&i| self.files.get(i))
                 .collect()
         }
+    }
+
+    /// Single entry to rename: cursor, or the one marked row when exactly one `selected_indices` entry.
+    pub fn rename_target_entry(&self) -> Option<&FileEntry> {
+        if self.selected_indices.len() > 1 {
+            return None;
+        }
+        if self.selected_indices.len() == 1 {
+            let idx = *self.selected_indices.iter().next()?;
+            return self.files.get(idx);
+        }
+        self.selected_file()
     }
     
     pub fn is_selected(&self, index: usize) -> bool {
@@ -1015,6 +1028,8 @@ pub struct App {
     pub directory_input: String,
     pub directory_completions: Vec<String>,
     pub directory_completion_index: usize,
+    pub rename_input: String,
+    pub rename_old_name: String,
     pub last_slash_press: Option<std::time::Instant>,
     /// First `Z` of a possible `Z Z` double-press; if no second `Z` within 400ms, a normal zip runs.
     pub zip_awaiting_second_press: Option<std::time::Instant>,
@@ -1077,6 +1092,8 @@ impl App {
             directory_input: String::new(),
             directory_completions: Vec::new(),
             directory_completion_index: 0,
+            rename_input: String::new(),
+            rename_old_name: String::new(),
             last_slash_press: None,
             zip_awaiting_second_press: None,
             pending_zip_transfer: false,
@@ -1916,6 +1933,157 @@ impl App {
         } else {
             AppMode::Normal
         };
+    }
+
+    pub fn refresh_focused_explorer(&mut self) {
+        match self.focus {
+            FocusPanel::Local | FocusPanel::ConnectionTabs => {
+                match LocalBrowser::refresh_files(&mut self.local.browser) {
+                    Ok(()) => {
+                        self.error_message = None;
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Refresh failed: {}", e));
+                    }
+                }
+            }
+            FocusPanel::Remote => {
+                if let Some(tab) = self.current_tab_mut() {
+                    match tab.refresh_directory() {
+                        Ok(()) => {
+                            self.error_message = None;
+                        }
+                        Err(e) => {
+                            self.error_message = Some(format!("Refresh failed: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn try_begin_rename(&mut self) {
+        if matches!(self.focus, FocusPanel::ConnectionTabs) {
+            return;
+        }
+        let multi = match self.focus {
+            FocusPanel::Local => self.local.browser.selected_indices.len() > 1,
+            FocusPanel::Remote => self
+                .current_tab()
+                .map(|t| t.browser.selected_indices.len() > 1)
+                .unwrap_or(false),
+            FocusPanel::ConnectionTabs => false,
+        };
+        if multi {
+            self.status_message = None;
+            self.error_message =
+                Some("Rename only works when a single item is selected".to_string());
+            return;
+        }
+        let entry = match self.focus {
+            FocusPanel::Local => self.local.browser.rename_target_entry().cloned(),
+            FocusPanel::Remote => self
+                .current_tab()
+                .and_then(|t| t.browser.rename_target_entry().cloned()),
+            FocusPanel::ConnectionTabs => None,
+        };
+        let Some(entry) = entry else {
+            return;
+        };
+        if entry.name == ".." {
+            self.error_message = Some("Cannot rename this entry".to_string());
+            self.status_message = None;
+            return;
+        }
+        self.rename_old_name = entry.name.clone();
+        self.rename_input = entry.name.clone();
+        self.error_message = None;
+        self.mode = AppMode::RenameInput;
+    }
+
+    pub fn close_rename(&mut self) {
+        self.rename_input.clear();
+        self.rename_old_name.clear();
+        self.mode = if !self.tabs.is_empty() {
+            AppMode::Connected
+        } else {
+            AppMode::Normal
+        };
+    }
+
+    pub fn rename_input_add_char(&mut self, c: char) {
+        self.rename_input.push(c);
+    }
+
+    pub fn rename_input_remove_char(&mut self) {
+        self.rename_input.pop();
+    }
+
+    pub fn commit_rename(&mut self) {
+        let new_name = self.rename_input.trim().to_string();
+        if new_name.is_empty() {
+            self.error_message = Some("Name cannot be empty".to_string());
+            self.status_message = None;
+            return;
+        }
+        if new_name.contains('/') || new_name.contains('\\') {
+            self.error_message = Some("Name cannot contain path separators".to_string());
+            self.status_message = None;
+            return;
+        }
+        if new_name == self.rename_old_name {
+            self.close_rename();
+            return;
+        }
+
+        let result = match self.focus {
+            FocusPanel::Local => {
+                let dir = PathBuf::from(&self.local.browser.current_dir);
+                let from = dir.join(&self.rename_old_name);
+                let to = dir.join(&new_name);
+                std::fs::rename(&from, &to).map_err(|e| e.to_string())
+            }
+            FocusPanel::Remote => {
+                if let Some(tab) = self.current_tab() {
+                    let base = tab.browser.current_dir.trim_end_matches('/');
+                    let old_path = format!("{}/{}", base, self.rename_old_name);
+                    let new_path = format!("{}/{}", base, new_name);
+                    match tab.connection.sftp() {
+                        Ok(sftp) => sftp
+                            .rename(Path::new(&old_path), Path::new(&new_path), None)
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    }
+                } else {
+                    Err("No remote session".to_string())
+                }
+            }
+            FocusPanel::ConnectionTabs => Err("Rename invalid for this focus".to_string()),
+        };
+
+        match result {
+            Ok(()) => {
+                self.error_message = None;
+                self.status_message = Some(format!("Renamed to \"{}\"", new_name));
+                match self.focus {
+                    FocusPanel::Local => {
+                        let _ = LocalBrowser::refresh_files(&mut self.local.browser);
+                        self.update_local_watcher();
+                    }
+                    FocusPanel::Remote => {
+                        if let Some(tab) = self.current_tab_mut() {
+                            let _ = tab.refresh_directory();
+                        }
+                    }
+                    FocusPanel::ConnectionTabs => {}
+                }
+                self.close_rename();
+            }
+            Err(e) => {
+                self.status_message = None;
+                self.error_message = Some(format!("Rename failed: {}", e));
+            }
+        }
     }
     
     pub fn directory_input_add_char(&mut self, c: char) {

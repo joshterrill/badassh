@@ -40,7 +40,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let is_connected = !app.tabs.is_empty();
     match app.mode {
-        AppMode::Connected | AppMode::DirectoryInput | AppMode::DeleteConfirm => {
+        AppMode::Connected | AppMode::DirectoryInput | AppMode::RenameInput | AppMode::DeleteConfirm => {
             draw_connected_view(frame, app, chunks[1]);
         }
         AppMode::MenuFocused | AppMode::MenuOpen | AppMode::Settings |
@@ -217,8 +217,14 @@ fn draw_normal_view(frame: &mut Frame, app: &mut App, area: Rect) {
     
     let columns = app.preferences.explorer_columns;
     let in_dir_input = app.mode == AppMode::DirectoryInput && app.focus == FocusPanel::Local;
+    let in_rename_input = app.mode == AppMode::RenameInput && app.focus == FocusPanel::Local;
     let dir_input = if in_dir_input { Some(&app.directory_input) } else { None };
-    let local_focused = app.focus == FocusPanel::Local && app.mode != AppMode::MenuOpen && app.mode != AppMode::MenuFocused;
+    let local_rename = if in_rename_input { Some(&app.rename_input) } else { None };
+    let local_focused = app.focus == FocusPanel::Local
+        && app.mode != AppMode::MenuOpen
+        && app.mode != AppMode::MenuFocused
+        && !in_dir_input
+        && !in_rename_input;
     let terminal_focused = app.terminal_focus == TerminalFocus::LocalTerminal;
     
     if app.local_terminal_visible {
@@ -234,11 +240,12 @@ fn draw_normal_view(frame: &mut Frame, app: &mut App, area: Rect) {
             frame, 
             &mut app.local.browser, 
             "Local", 
-            local_focused && !in_dir_input && !terminal_focused, 
+            local_focused && !in_dir_input && !in_rename_input && !terminal_focused, 
             local_chunks[0],
             &mut app.visible_file_rows,
             &columns,
             dir_input,
+            local_rename,
         );
         
         draw_terminal_panel(
@@ -253,11 +260,12 @@ fn draw_normal_view(frame: &mut Frame, app: &mut App, area: Rect) {
             frame, 
             &mut app.local.browser, 
             "Local", 
-            local_focused && !in_dir_input, 
+            local_focused && !in_dir_input && !in_rename_input, 
             chunks[0],
             &mut app.visible_file_rows,
             &columns,
             dir_input,
+            local_rename,
         );
     }
     
@@ -353,10 +361,17 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
         .split(area);
 
     let in_dir_input = app.mode == AppMode::DirectoryInput;
+    let in_rename_input = app.mode == AppMode::RenameInput;
     let local_terminal_focused = app.terminal_focus == TerminalFocus::LocalTerminal;
     let remote_terminal_focused = app.terminal_focus == TerminalFocus::RemoteTerminal;
-    let local_focused = app.focus == FocusPanel::Local && !in_dir_input && !local_terminal_focused;
-    let remote_focused = app.focus == FocusPanel::Remote && !in_dir_input && !remote_terminal_focused;
+    let local_focused = app.focus == FocusPanel::Local
+        && !in_dir_input
+        && !in_rename_input
+        && !local_terminal_focused;
+    let remote_focused = app.focus == FocusPanel::Remote
+        && !in_dir_input
+        && !in_rename_input
+        && !remote_terminal_focused;
     let columns = app.preferences.explorer_columns;
     
     let local_dir_input = if in_dir_input && app.focus == FocusPanel::Local {
@@ -366,6 +381,16 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
     };
     let remote_dir_input = if in_dir_input && app.focus == FocusPanel::Remote {
         Some(&app.directory_input)
+    } else {
+        None
+    };
+    let local_rename_input = if in_rename_input && app.focus == FocusPanel::Local {
+        Some(&app.rename_input)
+    } else {
+        None
+    };
+    let remote_rename_input = if in_rename_input && app.focus == FocusPanel::Remote {
+        Some(&app.rename_input)
     } else {
         None
     };
@@ -388,6 +413,7 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
             &mut app.visible_file_rows,
             &columns,
             local_dir_input,
+            local_rename_input,
         );
         
         draw_terminal_panel(
@@ -407,6 +433,7 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
             &mut app.visible_file_rows,
             &columns,
             local_dir_input,
+            local_rename_input,
         );
     }
 
@@ -433,6 +460,7 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
                 &mut app.visible_file_rows,
                 &columns,
                 remote_dir_input,
+                remote_rename_input,
             );
             
             draw_remote_terminal_panel(
@@ -453,6 +481,7 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
             &mut app.visible_file_rows,
             &columns,
             remote_dir_input,
+            remote_rename_input,
         );
     }
 }
@@ -562,12 +591,22 @@ fn draw_file_panel(
     visible_rows: &mut usize,
     columns: &ExplorerColumns,
     directory_input: Option<&String>,
+    rename_input: Option<&String>,
 ) {
     let in_dir_input = directory_input.is_some();
-    let border_color = if in_dir_input { ACCENT } else if is_focused { ACCENT } else { BORDER };
+    let in_rename_input = rename_input.is_some();
+    let border_color = if in_dir_input || in_rename_input {
+        ACCENT
+    } else if is_focused {
+        ACCENT
+    } else {
+        BORDER
+    };
 
     let full_title = if let Some(dir_input) = directory_input {
         format!(" {} - {}█ ", title, dir_input)
+    } else if let Some(rn) = rename_input {
+        format!(" {} - rename: {}█ ", title, rn)
     } else {
         match browser.filter_mode {
             FilterMode::None => format!(" {} - {} ", title, browser.current_dir),
@@ -576,7 +615,7 @@ fn draw_file_panel(
         }
     };
     
-    let title_style = if in_dir_input {
+    let title_style = if in_dir_input || in_rename_input {
         Style::default().fg(Color::White).bg(ACCENT).add_modifier(Modifier::BOLD)
     } else if is_focused {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
@@ -1143,6 +1182,8 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
         ("Shift+↑/↓", "Range select multiple items"),
         ("", ""),
         ("", "── File Operations ──"),
+        ("Ctrl+R", "Refresh file list (focused panel)"),
+        ("R", "Rename selected item (single selection only)"),
         ("D", "Download selected (remote panel)"),
         ("U", "Upload selected (local panel)"),
         ("Z", "Zip selected files/folders"),
@@ -1279,7 +1320,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         match app.mode {
             AppMode::Normal => match app.focus {
-                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex Z:Zip X:Del /:Path Tab:Next area `:Term",
+                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex R:Rename Ctrl+R:Refresh Z:Zip X:Del /:Path Tab:Next area `:Term",
                 FocusPanel::Remote => "↑↓:Nav Enter:Connect Tab:Next area",
                 FocusPanel::ConnectionTabs => "Tab:Next area",
             },
@@ -1288,11 +1329,12 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             AppMode::ConnectionDialog => "Tab:Next Enter:Connect Esc:Cancel",
             AppMode::ConnectionList => "↑↓:Nav Enter:Connect Esc:Close",
             AppMode::Connected => match app.focus {
-                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex U:Upload Z:Zip X:Del /:Path Tab:Next area `:Term",
-                FocusPanel::Remote => "↑↓:Nav Enter:Open ::Filter ;:Regex D:Download Z:Zip X:Del /:Path Tab:Next area `:Term",
+                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex R:Rename Ctrl+R:Refresh U:Upload Z:Zip X:Del /:Path Tab:Next area `:Term",
+                FocusPanel::Remote => "↑↓:Nav Enter:Open ::Filter ;:Regex R:Rename Ctrl+R:Refresh D:Download Z:Zip X:Del /:Path Tab:Next area `:Term",
                 FocusPanel::ConnectionTabs => "←→:Select Enter:Switch session Tab:Next area Esc:Files",
             },
             AppMode::DirectoryInput => "Tab:Complete Enter:Go Esc:Cancel",
+            AppMode::RenameInput => "Enter:Apply Esc:Cancel Backspace:Delete char",
             AppMode::DeleteConfirm => "←→:Select Enter:Confirm Esc:Cancel",
             AppMode::Settings => "↑↓ Space:Toggle Enter:Edit editor Esc:Close",
             AppMode::KeyboardShortcuts => "↑↓ j/k Ctrl+Y/V PgUp/Dn Home/End Esc:Close",

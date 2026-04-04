@@ -123,6 +123,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
         AppMode::ConnectionList => handle_connection_list_keys(app, key),
         AppMode::Connected => handle_connected_keys(app, key),
         AppMode::DirectoryInput => handle_directory_input_keys(app, key),
+        AppMode::RenameInput => handle_rename_input_keys(app, key),
         AppMode::DeleteConfirm => handle_delete_confirm_keys(app, key),
         AppMode::Settings => handle_settings_keys(app, key),
         AppMode::KeyboardShortcuts => handle_keyboard_shortcuts_keys(app, key),
@@ -446,6 +447,11 @@ fn handle_connected_keys(app: &mut App, key: KeyEvent) {
             KeyCode::Right => app.tab_bar_highlight_next(),
             KeyCode::Enter => app.activate_highlighted_connection_tab(),
             KeyCode::Esc => app.focus = FocusPanel::Local,
+            KeyCode::Char(c)
+                if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') =>
+            {
+                app.refresh_focused_explorer();
+            }
             _ => {}
         }
         return;
@@ -481,6 +487,16 @@ fn handle_directory_input_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Backspace => app.directory_input_remove_char(),
         KeyCode::Char('/') => app.handle_slash_press(),
         KeyCode::Char(c) => app.directory_input_add_char(c),
+        _ => {}
+    }
+}
+
+fn handle_rename_input_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.close_rename(),
+        KeyCode::Enter => app.commit_rename(),
+        KeyCode::Backspace => app.rename_input_remove_char(),
+        KeyCode::Char(c) => app.rename_input_add_char(c),
         _ => {}
     }
 }
@@ -583,6 +599,9 @@ fn handle_local_panel_keys(app: &mut App, key: KeyEvent) {
             KeyCode::Down => {
                 app.local.browser.move_down();
             }
+            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') => {
+                app.refresh_focused_explorer();
+            }
             KeyCode::Char(c) => {
                 app.local.browser.add_filter_char(c);
             }
@@ -596,6 +615,12 @@ fn handle_local_panel_keys(app: &mut App, key: KeyEvent) {
             if !app.try_clear_file_panel_selection() {
                 app.open_file_menu();
             }
+        }
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') => {
+            app.refresh_focused_explorer();
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.try_begin_rename();
         }
         KeyCode::Char(':') => app.local.browser.start_filter(FilterMode::Normal),
         KeyCode::Char(';') => app.local.browser.start_filter(FilterMode::Regex),
@@ -672,6 +697,9 @@ fn handle_remote_panel_keys(app: &mut App, key: KeyEvent) {
                     tab.browser.move_down();
                 }
             }
+            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') => {
+                app.refresh_focused_explorer();
+            }
             KeyCode::Char(c) => {
                 if let Some(tab) = app.current_tab_mut() {
                     tab.browser.add_filter_char(c);
@@ -687,6 +715,12 @@ fn handle_remote_panel_keys(app: &mut App, key: KeyEvent) {
             if !app.try_clear_file_panel_selection() {
                 app.open_file_menu();
             }
+        }
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') => {
+            app.refresh_focused_explorer();
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.try_begin_rename();
         }
         KeyCode::Char(':') => {
             if let Some(tab) = app.current_tab_mut() {
@@ -771,6 +805,9 @@ fn handle_file_browser_keys(app: &mut App, key: KeyEvent) {
             KeyCode::Down => {
                 app.local.browser.move_down();
             }
+            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') => {
+                app.refresh_focused_explorer();
+            }
             KeyCode::Char(c) => {
                 app.local.browser.add_filter_char(c);
             }
@@ -784,6 +821,12 @@ fn handle_file_browser_keys(app: &mut App, key: KeyEvent) {
             if !app.try_clear_file_panel_selection() {
                 app.open_file_menu();
             }
+        }
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') => {
+            app.refresh_focused_explorer();
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.try_begin_rename();
         }
         KeyCode::Char('/') => app.handle_slash_press(),
         KeyCode::Char(':') => app.local.browser.start_filter(FilterMode::Normal),
@@ -900,7 +943,10 @@ fn handle_mouse_click(app: &mut App, x: u16, y: u16, area: Rect) {
         }
     }
 
-    if matches!(app.mode, AppMode::Connected | AppMode::DirectoryInput) {
+    if matches!(
+        app.mode,
+        AppMode::Connected | AppMode::DirectoryInput | AppMode::RenameInput
+    ) {
         let main_area_y_start = 1;
         let main_area_y_end = area.height.saturating_sub(3);
         
@@ -914,6 +960,9 @@ fn handle_mouse_click(app: &mut App, x: u16, y: u16, area: Rect) {
             
             if app.mode == AppMode::DirectoryInput {
                 app.close_directory_input();
+            }
+            if app.mode == AppMode::RenameInput {
+                app.close_rename();
             }
         }
     }
