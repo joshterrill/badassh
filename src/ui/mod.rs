@@ -254,6 +254,7 @@ fn draw_normal_view(frame: &mut Frame, app: &mut App, area: Rect) {
             "Local Terminal",
             terminal_focused,
             local_chunks[1],
+            &mut app.visible_local_terminal_rows,
         );
     } else {
         draw_file_panel(
@@ -422,6 +423,7 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
             "Local Terminal",
             local_terminal_focused,
             local_chunks[1],
+            &mut app.visible_local_terminal_rows,
         );
     } else {
         draw_file_panel(
@@ -469,6 +471,7 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
                 "Remote Terminal",
                 remote_terminal_focused,
                 remote_chunks[1],
+                &mut app.visible_remote_terminal_rows,
             );
         }
     } else if let Some(tab) = app.tabs.get_mut(app.active_tab) {
@@ -492,6 +495,7 @@ fn draw_terminal_panel(
     title: &str,
     is_focused: bool,
     area: Rect,
+    visible_rows_out: &mut usize,
 ) {
     let border_color = if is_focused { ACCENT } else { BORDER };
     
@@ -511,10 +515,19 @@ fn draw_terminal_panel(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     
+    *visible_rows_out = inner.height.max(1) as usize;
+    
     if let Some(term) = terminal {
-        let _ = term.resize(inner.width, inner.height);
+        let height = inner.height.max(1) as usize;
+        let total = term.total_line_count();
+        let show_scrollbar = total > height;
+        let term_cols = if show_scrollbar {
+            inner.width.saturating_sub(1).max(1)
+        } else {
+            inner.width.max(1)
+        };
+        let _ = term.resize(term_cols, inner.height.max(1));
         
-        let height = inner.height as usize;
         let lines = term.get_visible_lines(height);
         
         let text_lines: Vec<Line> = lines
@@ -522,10 +535,36 @@ fn draw_terminal_panel(
             .map(|line| Line::from(Span::styled(line.clone(), Style::default().fg(TEXT))))
             .collect();
         
+        let content_w = if show_scrollbar {
+            inner.width.saturating_sub(1)
+        } else {
+            inner.width
+        };
+        let content_area = Rect::new(inner.x, inner.y, content_w, inner.height);
+        
         let para = Paragraph::new(text_lines)
             .style(Style::default().bg(Color::Rgb(25, 28, 33)));
         
-        frame.render_widget(para, inner);
+        frame.render_widget(para, content_area);
+        
+        if show_scrollbar {
+            let first = term.first_visible_line(height);
+            let max_scroll = total.saturating_sub(height);
+            let scrollbar_position = if max_scroll == 0 {
+                0
+            } else {
+                first.saturating_mul(total.saturating_sub(1)) / max_scroll
+            };
+            let scrollbar_area = Rect::new(inner.x + content_w, inner.y, 1, inner.height);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .track_symbol(Some("│"))
+                .thumb_symbol("█");
+            let mut scrollbar_state = ScrollbarState::new(total.max(1))
+                .position(scrollbar_position.min(total.saturating_sub(1)));
+            frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+        }
     } else {
         let text = Paragraph::new("Terminal not initialized")
             .style(Style::default().fg(TEXT_DIM))
@@ -540,6 +579,7 @@ fn draw_remote_terminal_panel(
     title: &str,
     is_focused: bool,
     area: Rect,
+    visible_rows_out: &mut usize,
 ) {
     let border_color = if is_focused { ACCENT } else { BORDER };
     
@@ -559,10 +599,19 @@ fn draw_remote_terminal_panel(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     
+    *visible_rows_out = inner.height.max(1) as usize;
+    
     if let Some(term) = terminal {
-        let _ = term.resize(inner.width, inner.height);
+        let height = inner.height.max(1) as usize;
+        let total = term.total_line_count();
+        let show_scrollbar = total > height;
+        let term_cols = if show_scrollbar {
+            inner.width.saturating_sub(1).max(1)
+        } else {
+            inner.width.max(1)
+        };
+        let _ = term.resize(term_cols, inner.height.max(1));
         
-        let height = inner.height as usize;
         let lines = term.get_visible_lines(height);
         
         let text_lines: Vec<Line> = lines
@@ -570,10 +619,36 @@ fn draw_remote_terminal_panel(
             .map(|line| Line::from(Span::styled(line.clone(), Style::default().fg(TEXT))))
             .collect();
         
+        let content_w = if show_scrollbar {
+            inner.width.saturating_sub(1)
+        } else {
+            inner.width
+        };
+        let content_area = Rect::new(inner.x, inner.y, content_w, inner.height);
+        
         let para = Paragraph::new(text_lines)
             .style(Style::default().bg(Color::Rgb(25, 28, 33)));
         
-        frame.render_widget(para, inner);
+        frame.render_widget(para, content_area);
+        
+        if show_scrollbar {
+            let first = term.first_visible_line(height);
+            let max_scroll = total.saturating_sub(height);
+            let scrollbar_position = if max_scroll == 0 {
+                0
+            } else {
+                first.saturating_mul(total.saturating_sub(1)) / max_scroll
+            };
+            let scrollbar_area = Rect::new(inner.x + content_w, inner.y, 1, inner.height);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .track_symbol(Some("│"))
+                .thumb_symbol("█");
+            let mut scrollbar_state = ScrollbarState::new(total.max(1))
+                .position(scrollbar_position.min(total.saturating_sub(1)));
+            frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+        }
     } else {
         let text = Paragraph::new("Terminal not initialized")
             .style(Style::default().fg(TEXT_DIM))
@@ -1169,7 +1244,7 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
     let shortcuts = vec![
         ("", "── Navigation ──"),
         ("↑/↓", "Move selection up/down"),
-        ("Ctrl+Y/Ctrl+V", "Page up/down (explorer & scrollable dialogs)"),
+        ("Ctrl+Y/Ctrl+V", "Page up/down (explorer, dialogs, terminal)"),
         ("Tab", "Switch panel (local ↔ remote/connections)"),
         ("Shift+Tab", "Switch to previous panel or menu"),
         ("Enter", "Open file/folder or connect"),
@@ -1206,8 +1281,9 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
         ("", "── Terminal ──"),
         ("`", "Toggle and focus terminal"),
         ("Esc", "Unfocus terminal"),
-        ("Shift+↑/↓", "Scroll terminal output"),
-        ("PgUp/PgDn", "Scroll terminal output (fast)"),
+        ("Ctrl+↑/Ctrl+↓", "Scroll terminal by one line (↑↓ alone: shell history)"),
+        ("Ctrl+Y/Ctrl+V", "Page up/down in terminal (matches explorer)"),
+        ("PgUp/PgDn", "Page up/down in terminal"),
         ("", ""),
         ("", "── This Dialog ──"),
         ("↑↓/j k", "Scroll shortcuts"),
@@ -1316,7 +1392,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let hints = if app.terminal_focus != TerminalFocus::None {
-        "Type to input | Shift+↑↓:Scroll | PgUp/PgDn:Scroll | Esc:Unfocus"
+        "Type to input | Ctrl+↑↓:Line scroll | Ctrl+Y/V PgUp/Dn:Page | Esc:Unfocus"
     } else {
         match app.mode {
             AppMode::Normal => match app.focus {

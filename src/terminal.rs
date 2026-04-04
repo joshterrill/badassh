@@ -65,6 +65,28 @@ const MAX_SCROLLBACK: usize = 5000;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
+/// Virtual document is scrollback rows (oldest first) then live screen rows (`screen_rows` lines).
+/// Returns `(total_lines, index_of_top_visible_line)` for the current `scroll_offset` and viewport height.
+fn scroll_viewport_top(
+    scroll_offset: usize,
+    scrollback_len: usize,
+    screen_rows: usize,
+    viewport_height: usize,
+) -> (usize, usize) {
+    let total = scrollback_len + screen_rows;
+    if total == 0 {
+        return (0, 0);
+    }
+    let vh = viewport_height.min(total);
+    let bottom_start = total.saturating_sub(vh);
+    let top = if scroll_offset == 0 {
+        bottom_start
+    } else {
+        bottom_start.saturating_sub(scroll_offset)
+    };
+    (total, top)
+}
+
 fn shell_cwd_from_pid(pid: u32) -> Option<PathBuf> {
     let mut sys = System::new_with_specifics(
         RefreshKind::new().with_processes(ProcessRefreshKind::new().with_cwd(UpdateKind::Always)),
@@ -654,6 +676,22 @@ impl LocalTerminal {
         }
     }
 
+    pub fn total_line_count(&self) -> usize {
+        let s = self.screen.lock();
+        s.scrollback.len() + s.rows
+    }
+
+    pub fn first_visible_line(&self, viewport_height: usize) -> usize {
+        let s = self.screen.lock();
+        scroll_viewport_top(
+            self.scroll_offset,
+            s.scrollback.len(),
+            s.rows,
+            viewport_height,
+        )
+        .1
+    }
+
     pub fn scroll_up(&mut self, lines: usize) {
         let total = self.screen.lock().scrollback.len();
         self.scroll_offset = (self.scroll_offset + lines).min(total);
@@ -873,6 +911,22 @@ impl RemoteTerminal {
         } else {
             screen.get_lines_with_scrollback(height, self.scroll_offset)
         }
+    }
+
+    pub fn total_line_count(&self) -> usize {
+        let s = self.screen.lock();
+        s.scrollback.len() + s.rows
+    }
+
+    pub fn first_visible_line(&self, viewport_height: usize) -> usize {
+        let s = self.screen.lock();
+        scroll_viewport_top(
+            self.scroll_offset,
+            s.scrollback.len(),
+            s.rows,
+            viewport_height,
+        )
+        .1
     }
 
     pub fn scroll_up(&mut self, lines: usize) {

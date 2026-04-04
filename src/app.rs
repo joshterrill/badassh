@@ -1023,6 +1023,10 @@ pub struct App {
     pub status_message: Option<String>,
     pub error_message: Option<String>,
     pub visible_file_rows: usize,
+    /// Last rendered height of the local terminal panel (for page scroll / Ctrl+Y / Ctrl+V).
+    pub visible_local_terminal_rows: usize,
+    /// Last rendered height of the remote terminal panel.
+    pub visible_remote_terminal_rows: usize,
     pub transfer_manager: TransferManager,
     pub editor_manager: EditorManager,
     pub directory_input: String,
@@ -1087,6 +1091,8 @@ impl App {
             status_message: None,
             error_message: None,
             visible_file_rows: 10,
+            visible_local_terminal_rows: 1,
+            visible_remote_terminal_rows: 1,
             transfer_manager: TransferManager::new(4),
             editor_manager: EditorManager::new()?,
             directory_input: String::new(),

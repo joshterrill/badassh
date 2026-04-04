@@ -180,6 +180,7 @@ fn handle_keyboard_shortcuts_keys(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_terminal_keys(app: &mut App, key: KeyEvent) {
+    let page = terminal_viewport_lines(app);
     match key.code {
         KeyCode::Esc => {
             match app.terminal_focus {
@@ -196,6 +197,16 @@ fn handle_terminal_keys(app: &mut App, key: KeyEvent) {
                 TerminalFocus::None => {}
             }
             app.terminal_focus = TerminalFocus::None;
+        }
+        KeyCode::Char(c)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(c, 'y' | 'Y') =>
+        {
+            scroll_terminal(app, true, page);
+        }
+        KeyCode::Char(c)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(c, 'v' | 'V') =>
+        {
+            scroll_terminal(app, false, page);
         }
         KeyCode::Char(c) => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -218,14 +229,14 @@ fn handle_terminal_keys(app: &mut App, key: KeyEvent) {
             send_to_terminal(app, "\t");
         }
         KeyCode::Up => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
                 scroll_terminal(app, true, 1);
             } else {
                 send_to_terminal(app, "\x1b[A");
             }
         }
         KeyCode::Down => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
                 scroll_terminal(app, false, 1);
             } else {
                 send_to_terminal(app, "\x1b[B");
@@ -244,10 +255,10 @@ fn handle_terminal_keys(app: &mut App, key: KeyEvent) {
             send_to_terminal(app, "\x1b[F");
         }
         KeyCode::PageUp => {
-            scroll_terminal(app, true, 10);
+            scroll_terminal(app, true, page);
         }
         KeyCode::PageDown => {
-            scroll_terminal(app, false, 10);
+            scroll_terminal(app, false, page);
         }
         _ => {}
     }
@@ -274,6 +285,14 @@ fn send_to_terminal(app: &mut App, data: &str) {
             }
         }
         TerminalFocus::None => {}
+    }
+}
+
+fn terminal_viewport_lines(app: &App) -> usize {
+    match app.terminal_focus {
+        TerminalFocus::LocalTerminal => app.visible_local_terminal_rows.max(1),
+        TerminalFocus::RemoteTerminal => app.visible_remote_terminal_rows.max(1),
+        TerminalFocus::None => 1,
     }
 }
 
