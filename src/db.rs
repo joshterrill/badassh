@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -52,23 +52,23 @@ pub struct Database {
 impl Database {
     pub fn new() -> Result<Self> {
         let db_path = Self::get_db_path()?;
-        
+
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
+
         let conn = Connection::open(&db_path)?;
         let db = Self { conn };
         db.init_tables()?;
         Ok(db)
     }
-    
+
     fn get_db_path() -> Result<PathBuf> {
-        let config_dir = dirs::config_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?;
+        let config_dir =
+            dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?;
         Ok(config_dir.join("rust-sftp").join("connections.db"))
     }
-    
+
     fn init_tables(&self) -> Result<()> {
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS connections (
@@ -109,10 +109,10 @@ impl Database {
         )?;
         Ok(())
     }
-    
+
     pub fn save_connection(&self, conn: &SavedConnection) -> Result<()> {
         let auth_method_json = serde_json::to_string(&conn.auth_method)?;
-        
+
         self.conn.execute(
             "INSERT OR REPLACE INTO connections 
              (id, name, host, port, username, auth_method, created_at, last_used_at)
@@ -130,32 +130,41 @@ impl Database {
         )?;
         Ok(())
     }
-    
+
     pub fn get_all_connections(&self) -> Result<Vec<SavedConnection>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, host, port, username, auth_method, created_at, last_used_at 
-             FROM connections ORDER BY name"
+             FROM connections ORDER BY name",
         )?;
-        
+
         let connections = stmt.query_map([], |row| {
             let auth_method_json: String = row.get(5)?;
-            let auth_method: AuthMethod = serde_json::from_str(&auth_method_json)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    5, rusqlite::types::Type::Text, Box::new(e)
-                ))?;
-            
+            let auth_method: AuthMethod = serde_json::from_str(&auth_method_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+
             let created_at_str: String = row.get(6)?;
             let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    6, rusqlite::types::Type::Text, Box::new(e)
-                ))?
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?
                 .with_timezone(&Utc);
-            
+
             let last_used_at: Option<String> = row.get(7)?;
             let last_used_at = last_used_at.and_then(|s| {
-                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
             });
-            
+
             Ok(SavedConnection {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -167,38 +176,49 @@ impl Database {
                 last_used_at,
             })
         })?;
-        
-        connections.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+
+        connections
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
-    
+
     pub fn get_recent_connections(&self, limit: usize) -> Result<Vec<SavedConnection>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, host, port, username, auth_method, created_at, last_used_at 
              FROM connections 
              WHERE last_used_at IS NOT NULL
              ORDER BY last_used_at DESC
-             LIMIT ?1"
+             LIMIT ?1",
         )?;
-        
+
         let connections = stmt.query_map([limit], |row| {
             let auth_method_json: String = row.get(5)?;
-            let auth_method: AuthMethod = serde_json::from_str(&auth_method_json)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    5, rusqlite::types::Type::Text, Box::new(e)
-                ))?;
-            
+            let auth_method: AuthMethod = serde_json::from_str(&auth_method_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+
             let created_at_str: String = row.get(6)?;
             let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                    6, rusqlite::types::Type::Text, Box::new(e)
-                ))?
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?
                 .with_timezone(&Utc);
-            
+
             let last_used_at: Option<String> = row.get(7)?;
             let last_used_at = last_used_at.and_then(|s| {
-                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
             });
-            
+
             Ok(SavedConnection {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -210,10 +230,12 @@ impl Database {
                 last_used_at,
             })
         })?;
-        
-        connections.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+
+        connections
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
-    
+
     pub fn update_last_used(&self, id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE connections SET last_used_at = ?1 WHERE id = ?2",
@@ -221,10 +243,11 @@ impl Database {
         )?;
         Ok(())
     }
-    
+
     #[allow(dead_code)]
     pub fn delete_connection(&self, id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM connections WHERE id = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM connections WHERE id = ?1", [id])?;
         Ok(())
     }
 }

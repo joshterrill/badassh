@@ -6,7 +6,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Wrap,
+    },
     Frame,
 };
 
@@ -40,12 +43,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let is_connected = !app.tabs.is_empty();
     match app.mode {
-        AppMode::Connected | AppMode::DirectoryInput | AppMode::RenameInput | AppMode::DeleteConfirm => {
+        AppMode::Connected
+        | AppMode::DirectoryInput
+        | AppMode::RenameInput
+        | AppMode::DeleteConfirm => {
             draw_connected_view(frame, app, chunks[1]);
         }
-        AppMode::MenuFocused | AppMode::MenuOpen | AppMode::Settings |
-        AppMode::KeyboardShortcuts | AppMode::ConnectionDialog |
-        AppMode::ConnectionList => {
+        AppMode::MenuFocused
+        | AppMode::MenuOpen
+        | AppMode::Settings
+        | AppMode::KeyboardShortcuts
+        | AppMode::ConnectionDialog
+        | AppMode::ConnectionList => {
             if is_connected {
                 draw_connected_view(frame, app, chunks[1]);
             } else {
@@ -73,11 +82,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.mode == AppMode::DeleteConfirm {
         draw_delete_confirm(frame, app, chunks[1]);
     }
-    
+
     if app.mode == AppMode::Settings {
         draw_settings(frame, app);
     }
-    
+
     if app.mode == AppMode::KeyboardShortcuts {
         draw_keyboard_shortcuts(frame, app);
     }
@@ -161,7 +170,11 @@ fn draw_dropdown_menu(frame: &mut Frame, app: &App) {
             app.file_menu_index,
         ),
         MenuTab::Connect => (
-            vec!["New Connection".to_string(), "Recent Connections".to_string(), "Show All Connections".to_string()],
+            vec![
+                "New Connection".to_string(),
+                "Recent Connections".to_string(),
+                "Show All Connections".to_string(),
+            ],
             8,
             app.connect_menu_index,
         ),
@@ -195,13 +208,12 @@ fn draw_dropdown_menu(frame: &mut Frame, app: &App) {
         })
         .collect();
 
-    let list = List::new(list_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(BORDER))
-                .style(Style::default().bg(PANEL_BG)),
-        );
+    let list = List::new(list_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(BORDER))
+            .style(Style::default().bg(PANEL_BG)),
+    );
 
     frame.render_widget(list, area);
 }
@@ -209,45 +221,47 @@ fn draw_dropdown_menu(frame: &mut Frame, app: &App) {
 fn draw_normal_view(frame: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
-    
+
     let columns = app.preferences.explorer_columns;
     let in_dir_input = app.mode == AppMode::DirectoryInput && app.focus == FocusPanel::Local;
     let in_rename_input = app.mode == AppMode::RenameInput && app.focus == FocusPanel::Local;
-    let dir_input = if in_dir_input { Some(&app.directory_input) } else { None };
-    let local_rename = if in_rename_input { Some(&app.rename_input) } else { None };
+    let dir_input = if in_dir_input {
+        Some(&app.directory_input)
+    } else {
+        None
+    };
+    let local_rename = if in_rename_input {
+        Some(&app.rename_input)
+    } else {
+        None
+    };
     let local_focused = app.focus == FocusPanel::Local
         && app.mode != AppMode::MenuOpen
         && app.mode != AppMode::MenuFocused
         && !in_dir_input
         && !in_rename_input;
     let terminal_focused = app.terminal_focus == TerminalFocus::LocalTerminal;
-    
+
     if app.local_terminal_visible {
         let local_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(67),
-                Constraint::Percentage(33),
-            ])
+            .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
             .split(chunks[0]);
-        
+
         draw_file_panel(
-            frame, 
-            &mut app.local.browser, 
-            "Local", 
-            local_focused && !in_dir_input && !in_rename_input && !terminal_focused, 
+            frame,
+            &mut app.local.browser,
+            "Local",
+            local_focused && !in_dir_input && !in_rename_input && !terminal_focused,
             local_chunks[0],
             &mut app.visible_file_rows,
             &columns,
             dir_input,
             local_rename,
         );
-        
+
         draw_terminal_panel(
             frame,
             app.local_terminal.as_mut(),
@@ -258,10 +272,10 @@ fn draw_normal_view(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     } else {
         draw_file_panel(
-            frame, 
-            &mut app.local.browser, 
-            "Local", 
-            local_focused && !in_dir_input && !in_rename_input, 
+            frame,
+            &mut app.local.browser,
+            "Local",
+            local_focused && !in_dir_input && !in_rename_input,
             chunks[0],
             &mut app.visible_file_rows,
             &columns,
@@ -269,14 +283,16 @@ fn draw_normal_view(frame: &mut Frame, app: &mut App, area: Rect) {
             local_rename,
         );
     }
-    
-    let remote_focused = app.focus == FocusPanel::Remote && app.mode != AppMode::MenuOpen && app.mode != AppMode::MenuFocused;
+
+    let remote_focused = app.focus == FocusPanel::Remote
+        && app.mode != AppMode::MenuOpen
+        && app.mode != AppMode::MenuFocused;
     draw_connections_panel(frame, app, chunks[1], remote_focused);
 }
 
 fn draw_connections_panel(frame: &mut Frame, app: &App, area: Rect, is_focused: bool) {
     let border_color = if is_focused { ACCENT } else { BORDER };
-    
+
     let block = Block::default()
         .title(Span::styled(
             " Recent Connections ",
@@ -289,45 +305,57 @@ fn draw_connections_panel(frame: &mut Frame, app: &App, area: Rect, is_focused: 
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(PANEL_BG));
-    
+
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    
+
     let connections = &app.recent_connections;
     let _total_items = connections.len() + 1;
-    
+
     let mut items: Vec<ListItem> = connections
         .iter()
         .enumerate()
         .map(|(i, conn)| {
             let is_selected = app.connection_list_index == i && is_focused;
-            let text = format!(" {} ({}@{}:{}) ", conn.name, conn.username, conn.host, conn.port);
-            
+            let text = format!(
+                " {} ({}@{}:{}) ",
+                conn.name, conn.username, conn.host, conn.port
+            );
+
             let style = if is_selected {
-                Style::default().bg(MENU_SELECTED).fg(Color::Black).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(MENU_SELECTED)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(TEXT)
             };
-            
+
             ListItem::new(Span::styled(text, style))
         })
         .collect();
-    
+
     if !connections.is_empty() {
         items.push(ListItem::new(Span::styled(
             " ─────────────────────────── ",
             Style::default().fg(BORDER),
         )));
     }
-    
+
     let new_conn_selected = app.connection_list_index == connections.len() && is_focused;
     let new_conn_style = if new_conn_selected {
-        Style::default().bg(MENU_SELECTED).fg(Color::Black).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(MENU_SELECTED)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(ACCENT)
     };
-    items.push(ListItem::new(Span::styled(" + New Connection ", new_conn_style)));
-    
+    items.push(ListItem::new(Span::styled(
+        " + New Connection ",
+        new_conn_style,
+    )));
+
     if connections.is_empty() {
         let empty_msg = ListItem::new(Span::styled(
             " No recent connections ",
@@ -335,12 +363,11 @@ fn draw_connections_panel(frame: &mut Frame, app: &App, area: Rect, is_focused: 
         ));
         items.insert(0, empty_msg);
     }
-    
-    let list = List::new(items)
-        .style(Style::default().bg(PANEL_BG));
-    
+
+    let list = List::new(items).style(Style::default().bg(PANEL_BG));
+
     frame.render_widget(list, inner);
-    
+
     if is_focused && inner.height > 2 {
         let hint = Paragraph::new(Span::styled(
             "Enter:Connect Tab:Next area",
@@ -355,10 +382,7 @@ fn draw_connections_panel(frame: &mut Frame, app: &App, area: Rect, is_focused: 
 fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
     let in_dir_input = app.mode == AppMode::DirectoryInput;
@@ -374,7 +398,7 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
         && !in_rename_input
         && !remote_terminal_focused;
     let columns = app.preferences.explorer_columns;
-    
+
     let local_dir_input = if in_dir_input && app.focus == FocusPanel::Local {
         Some(&app.directory_input)
     } else {
@@ -395,28 +419,25 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         None
     };
-    
+
     if app.local_terminal_visible {
         let local_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(67),
-                Constraint::Percentage(33),
-            ])
+            .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
             .split(chunks[0]);
-        
+
         draw_file_panel(
-            frame, 
-            &mut app.local.browser, 
-            "Local", 
-            local_focused, 
+            frame,
+            &mut app.local.browser,
+            "Local",
+            local_focused,
             local_chunks[0],
             &mut app.visible_file_rows,
             &columns,
             local_dir_input,
             local_rename_input,
         );
-        
+
         draw_terminal_panel(
             frame,
             app.local_terminal.as_mut(),
@@ -427,10 +448,10 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     } else {
         draw_file_panel(
-            frame, 
-            &mut app.local.browser, 
-            "Local", 
-            local_focused, 
+            frame,
+            &mut app.local.browser,
+            "Local",
+            local_focused,
             chunks[0],
             &mut app.visible_file_rows,
             &columns,
@@ -439,19 +460,18 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     }
 
-    let remote_terminal_visible = app.tabs.get(app.active_tab)
+    let remote_terminal_visible = app
+        .tabs
+        .get(app.active_tab)
         .map(|t| t.remote_terminal_visible)
         .unwrap_or(false);
-    
+
     if remote_terminal_visible {
         let remote_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(67),
-                Constraint::Percentage(33),
-            ])
+            .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
             .split(chunks[1]);
-        
+
         if let Some(tab) = app.tabs.get_mut(app.active_tab) {
             draw_file_panel(
                 frame,
@@ -464,7 +484,7 @@ fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
                 remote_dir_input,
                 remote_rename_input,
             );
-            
+
             draw_remote_terminal_panel(
                 frame,
                 tab.remote_terminal.as_mut(),
@@ -498,7 +518,7 @@ fn draw_terminal_panel(
     visible_rows_out: &mut usize,
 ) {
     let border_color = if is_focused { ACCENT } else { BORDER };
-    
+
     let block = Block::default()
         .title(Span::styled(
             format!(" {} ", title),
@@ -511,12 +531,12 @@ fn draw_terminal_panel(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(Color::Rgb(25, 28, 33)));
-    
+
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    
+
     *visible_rows_out = inner.height.max(1) as usize;
-    
+
     if let Some(term) = terminal {
         let height = inner.height.max(1) as usize;
         let total = term.total_line_count();
@@ -527,26 +547,25 @@ fn draw_terminal_panel(
             inner.width.max(1)
         };
         let _ = term.resize(term_cols, inner.height.max(1));
-        
+
         let lines = term.get_visible_lines(height);
-        
+
         let text_lines: Vec<Line> = lines
             .iter()
             .map(|line| Line::from(Span::styled(line.clone(), Style::default().fg(TEXT))))
             .collect();
-        
+
         let content_w = if show_scrollbar {
             inner.width.saturating_sub(1)
         } else {
             inner.width
         };
         let content_area = Rect::new(inner.x, inner.y, content_w, inner.height);
-        
-        let para = Paragraph::new(text_lines)
-            .style(Style::default().bg(Color::Rgb(25, 28, 33)));
-        
+
+        let para = Paragraph::new(text_lines).style(Style::default().bg(Color::Rgb(25, 28, 33)));
+
         frame.render_widget(para, content_area);
-        
+
         if show_scrollbar {
             let first = term.first_visible_line(height);
             let max_scroll = total.saturating_sub(height);
@@ -582,7 +601,7 @@ fn draw_remote_terminal_panel(
     visible_rows_out: &mut usize,
 ) {
     let border_color = if is_focused { ACCENT } else { BORDER };
-    
+
     let block = Block::default()
         .title(Span::styled(
             format!(" {} ", title),
@@ -595,12 +614,12 @@ fn draw_remote_terminal_panel(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(Color::Rgb(25, 28, 33)));
-    
+
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    
+
     *visible_rows_out = inner.height.max(1) as usize;
-    
+
     if let Some(term) = terminal {
         let height = inner.height.max(1) as usize;
         let total = term.total_line_count();
@@ -611,26 +630,25 @@ fn draw_remote_terminal_panel(
             inner.width.max(1)
         };
         let _ = term.resize(term_cols, inner.height.max(1));
-        
+
         let lines = term.get_visible_lines(height);
-        
+
         let text_lines: Vec<Line> = lines
             .iter()
             .map(|line| Line::from(Span::styled(line.clone(), Style::default().fg(TEXT))))
             .collect();
-        
+
         let content_w = if show_scrollbar {
             inner.width.saturating_sub(1)
         } else {
             inner.width
         };
         let content_area = Rect::new(inner.x, inner.y, content_w, inner.height);
-        
-        let para = Paragraph::new(text_lines)
-            .style(Style::default().bg(Color::Rgb(25, 28, 33)));
-        
+
+        let para = Paragraph::new(text_lines).style(Style::default().bg(Color::Rgb(25, 28, 33)));
+
         frame.render_widget(para, content_area);
-        
+
         if show_scrollbar {
             let first = term.first_visible_line(height);
             let max_scroll = total.saturating_sub(height);
@@ -685,19 +703,28 @@ fn draw_file_panel(
     } else {
         match browser.filter_mode {
             FilterMode::None => format!(" {} - {} ", title, browser.current_dir),
-            FilterMode::Normal => format!(" {} - {} [filter: {}] ", title, browser.current_dir, browser.filter),
-            FilterMode::Regex => format!(" {} - {} [regex: {}] ", title, browser.current_dir, browser.filter),
+            FilterMode::Normal => format!(
+                " {} - {} [filter: {}] ",
+                title, browser.current_dir, browser.filter
+            ),
+            FilterMode::Regex => format!(
+                " {} - {} [regex: {}] ",
+                title, browser.current_dir, browser.filter
+            ),
         }
     };
-    
+
     let title_style = if in_dir_input || in_rename_input {
-        Style::default().fg(Color::White).bg(ACCENT).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::White)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
     } else if is_focused {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(TEXT_DIM).add_modifier(Modifier::BOLD)
     };
-    
+
     let block = Block::default()
         .title(Span::styled(full_title, title_style))
         .borders(Borders::ALL)
@@ -707,32 +734,84 @@ fn draw_file_panel(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let file_list_height = inner.height as usize;
+    let show_headers = columns.show_headers && inner.height > 1;
+    let header_height = if show_headers { 1 } else { 0 };
+    let file_list_height = inner.height.saturating_sub(header_height) as usize;
     *visible_rows = file_list_height;
 
-    let files_area = Rect::new(inner.x, inner.y, inner.width.saturating_sub(1), inner.height);
-    
+    let header_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width.saturating_sub(1),
+        header_height,
+    );
+    let files_area = Rect::new(
+        inner.x,
+        inner.y + header_height,
+        inner.width.saturating_sub(1),
+        inner.height.saturating_sub(header_height),
+    );
+
     let total_width = files_area.width as usize;
     let mut extra_cols_width = 0usize;
-    if columns.show_size { extra_cols_width += 10; }
-    if columns.show_permissions { extra_cols_width += 12; }
-    if columns.show_modified { extra_cols_width += 18; }
-    if columns.show_created { extra_cols_width += 18; }
-    
+    if columns.show_size {
+        extra_cols_width += 10;
+    }
+    if columns.show_permissions {
+        extra_cols_width += 12;
+    }
+    if columns.show_modified {
+        extra_cols_width += 18;
+    }
+    if columns.show_created {
+        extra_cols_width += 18;
+    }
+
     let name_width = total_width.saturating_sub(extra_cols_width).max(20);
-    
+
+    if show_headers {
+        let header_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+        let mut header_spans = vec![Span::styled(
+            format!("{:<width$}", "Name", width = name_width),
+            header_style,
+        )];
+        if columns.show_size {
+            header_spans.push(Span::styled(format!("{:>9} ", "Size"), header_style));
+        }
+        if columns.show_permissions {
+            header_spans.push(Span::styled(
+                format!("{:<11} ", "Permissions"),
+                header_style,
+            ));
+        }
+        if columns.show_modified {
+            header_spans.push(Span::styled(
+                format!("{:<17} ", "Last Modified"),
+                header_style,
+            ));
+        }
+        if columns.show_created {
+            header_spans.push(Span::styled(format!("{:<17} ", "Created At"), header_style));
+        }
+
+        let header = Paragraph::new(Line::from(header_spans));
+        frame.render_widget(header, header_area);
+    }
+
     let filtered_len = browser.filtered_files().len();
     let selected_in_filtered = browser.selected_index.min(filtered_len.saturating_sub(1));
-    
+
     if selected_in_filtered < browser.scroll_offset {
         browser.scroll_offset = selected_in_filtered;
-    } else if file_list_height > 0 && selected_in_filtered >= browser.scroll_offset + file_list_height {
+    } else if file_list_height > 0
+        && selected_in_filtered >= browser.scroll_offset + file_list_height
+    {
         browser.scroll_offset = selected_in_filtered.saturating_sub(file_list_height) + 1;
     }
-    
+
     let scroll_offset = browser.scroll_offset.min(filtered_len.saturating_sub(1));
     let filtered = browser.filtered_files();
-    
+
     let items: Vec<ListItem> = filtered
         .iter()
         .enumerate()
@@ -742,15 +821,18 @@ fn draw_file_panel(
             let is_cursor = filtered_idx == selected_in_filtered;
             let is_selected = browser.is_selected(*original_idx);
             let name_color = if file.is_dir { DIR_COLOR } else { FILE_COLOR };
-            
+
             let base_style = if is_cursor && is_focused {
-                Style::default().bg(MENU_SELECTED).fg(Color::Black).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(MENU_SELECTED)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
             } else if is_selected {
                 Style::default().bg(SELECTED_BG).fg(name_color)
             } else {
                 Style::default().fg(name_color)
             };
-            
+
             let dim_style = if is_cursor && is_focused {
                 Style::default().bg(MENU_SELECTED).fg(Color::Black)
             } else if is_selected {
@@ -760,24 +842,34 @@ fn draw_file_panel(
             };
 
             let icon = if file.is_dir { "📁 " } else { "📄 " };
-            let marker = if is_selected && !is_cursor { "✓ " } else { "  " };
-            
+            let marker = if is_selected && !is_cursor {
+                "✓ "
+            } else {
+                "  "
+            };
+
             let name_display = format!("{}{}{}", marker, icon, file.name);
             let name_truncated = if name_display.chars().count() > name_width {
-                let mut s: String = name_display.chars().take(name_width.saturating_sub(1)).collect();
+                let mut s: String = name_display
+                    .chars()
+                    .take(name_width.saturating_sub(1))
+                    .collect();
                 s.push('…');
                 s
             } else {
                 format!("{:width$}", name_display, width = name_width)
             };
-            
+
             let mut spans = vec![Span::styled(name_truncated, base_style)];
-            
+
             if columns.show_size {
                 spans.push(Span::styled(format!("{:>9} ", file.size), dim_style));
             }
             if columns.show_permissions {
-                spans.push(Span::styled(format!("{:<11} ", file.permissions), dim_style));
+                spans.push(Span::styled(
+                    format!("{:<11} ", file.permissions),
+                    dim_style,
+                ));
             }
             if columns.show_modified {
                 spans.push(Span::styled(format!("{:<17} ", file.modified), dim_style));
@@ -794,30 +886,34 @@ fn draw_file_panel(
     let list = List::new(items);
     frame.render_widget(list, files_area);
 
-    if filtered_len > file_list_height {
-        let scrollbar_area = Rect::new(inner.x + inner.width - 1, inner.y, 1, inner.height);
+    if filtered_len > file_list_height && file_list_height > 0 {
+        let scrollbar_area = Rect::new(
+            inner.x + inner.width - 1,
+            inner.y + header_height,
+            1,
+            inner.height.saturating_sub(header_height),
+        );
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(Some("▲"))
             .end_symbol(Some("▼"))
             .track_symbol(Some("│"))
             .thumb_symbol("█");
-        
-        let mut scrollbar_state = ScrollbarState::new(filtered_len)
-            .position(selected_in_filtered);
-        
+
+        let mut scrollbar_state = ScrollbarState::new(filtered_len).position(selected_in_filtered);
+
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
 }
 
 fn draw_connection_dialog(frame: &mut Frame, app: &App) {
     let screen = frame.area();
-    
+
     let dialog_width = 70u16.min(screen.width.saturating_sub(2));
     let dialog_height = 25u16.min(screen.height.saturating_sub(2));
-    
+
     let dialog_x = screen.width.saturating_sub(dialog_width) / 2;
     let dialog_y = screen.height.saturating_sub(dialog_height) / 2;
-    
+
     let area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
     frame.render_widget(Clear, area);
 
@@ -846,16 +942,16 @@ fn draw_connection_dialog(frame: &mut Frame, app: &App) {
     ];
 
     let field_height = 3u16;
-    
+
     for (i, (field, label)) in fields.iter().enumerate() {
         let field_y = inner_y + (i as u16 * field_height);
-        
+
         if field_y + field_height > area.y + area.height - 1 {
             continue;
         }
-        
+
         let field_area = Rect::new(inner_x, field_y, inner_width, field_height);
-        
+
         let is_active = app.connection_dialog.active_field == *field;
         let value = app.connection_dialog.get_field_value(*field);
 
@@ -899,7 +995,7 @@ fn draw_connection_dialog(frame: &mut Frame, app: &App) {
         let error_y = inner_y + (6 * field_height);
         if error_y < area.y + area.height - 1 {
             let error_area = Rect::new(inner_x, error_y, inner_width, 2);
-            
+
             let error_para = Paragraph::new(Span::styled(
                 error.as_str(),
                 Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
@@ -914,13 +1010,13 @@ fn draw_connection_dialog(frame: &mut Frame, app: &App) {
 
 fn draw_connection_list(frame: &mut Frame, app: &App) {
     let screen = frame.area();
-    
+
     let list_width = 50u16.min(screen.width.saturating_sub(4));
     let list_height = 20u16.min(screen.height.saturating_sub(2));
-    
+
     let list_x = (screen.width.saturating_sub(list_width)) / 2;
     let list_y = (screen.height.saturating_sub(list_height)) / 2;
-    
+
     let area = Rect::new(list_x, list_y, list_width, list_height);
     frame.render_widget(Clear, area);
 
@@ -965,10 +1061,7 @@ fn draw_connection_list(frame: &mut Frame, app: &App) {
                 };
 
                 ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!(" {} ", conn.name),
-                        style,
-                    ),
+                    Span::styled(format!(" {} ", conn.name), style),
                     Span::styled(
                         format!(" ({}@{}:{}) ", conn.username, conn.host, conn.port),
                         if i == app.connection_list_index {
@@ -994,7 +1087,12 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App, main_area: Rect) {
         let half_width = main_area.width / 2;
         match app.focus {
             FocusPanel::Local => Rect::new(main_area.x, main_area.y, half_width, main_area.height),
-            FocusPanel::Remote => Rect::new(main_area.x + half_width, main_area.y, main_area.width - half_width, main_area.height),
+            FocusPanel::Remote => Rect::new(
+                main_area.x + half_width,
+                main_area.y,
+                main_area.width - half_width,
+                main_area.height,
+            ),
             FocusPanel::ConnectionTabs => main_area,
         }
     };
@@ -1078,13 +1176,19 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App, main_area: Rect) {
     btn_y += 1;
 
     let yes_style = if app.delete_confirm_yes {
-        Style::default().fg(Color::Black).bg(ERROR).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Black)
+            .bg(ERROR)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(TEXT)
     };
 
     let no_style = if !app.delete_confirm_yes {
-        Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Black)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(TEXT)
     };
@@ -1134,22 +1238,38 @@ fn draw_settings(frame: &mut Frame, app: &App) {
 
         let line = match i {
             0 => format!(
+                " {} File explorer: column headers",
+                if cols.show_headers { "[✓]" } else { "[ ]" }
+            ),
+            1 => format!(
                 " {} File explorer: file size column",
                 if cols.show_size { "[✓]" } else { "[ ]" }
             ),
-            1 => format!(
-                " {} File explorer: permissions column",
-                if cols.show_permissions { "[✓]" } else { "[ ]" }
-            ),
             2 => format!(
+                " {} File explorer: permissions column",
+                if cols.show_permissions {
+                    "[✓]"
+                } else {
+                    "[ ]"
+                }
+            ),
+            3 => format!(
                 " {} File explorer: last modified column",
                 if cols.show_modified { "[✓]" } else { "[ ]" }
             ),
-            3 => format!(
+            4 => format!(
                 " {} File explorer: created column",
                 if cols.show_created { "[✓]" } else { "[ ]" }
             ),
-            4 => {
+            5 => format!(
+                "    File explorer sort by: {}",
+                p.explorer_sort.field.label()
+            ),
+            6 => format!(
+                "    File explorer sort order: {}",
+                p.explorer_sort.direction.label()
+            ),
+            7 => {
                 let cmd = if editing_here {
                     format!("{}█", p.editor_command)
                 } else if p.editor_command.is_empty() {
@@ -1159,7 +1279,7 @@ fn draw_settings(frame: &mut Frame, app: &App) {
                 };
                 format!("    Editor command: {}", cmd)
             }
-            5 => format!(
+            8 => format!(
                 " {} Open terminal in same directory as file explorer",
                 if p.open_terminal_in_explorer_dir {
                     "[✓]"
@@ -1167,7 +1287,7 @@ fn draw_settings(frame: &mut Frame, app: &App) {
                     "[ ]"
                 }
             ),
-            6 => format!(
+            9 => format!(
                 " {} File explorer follows terminal directory changes",
                 if p.explorer_follows_terminal {
                     "[✓]"
@@ -1209,19 +1329,14 @@ fn draw_settings(frame: &mut Frame, app: &App) {
     ))
     .alignment(Alignment::Center);
     let hint_y = area.y + dialog_height.saturating_sub(2);
-    frame.render_widget(
-        hint,
-        Rect::new(area.x, hint_y, area.width, 1),
-    );
+    frame.render_widget(hint, Rect::new(area.x, hint_y, area.width, 1));
 }
 
 fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
 
     let dialog_width = 76u16.min(screen.width.saturating_sub(4));
-    let dialog_height = 26u16
-        .min(screen.height.saturating_sub(6))
-        .max(14);
+    let dialog_height = 26u16.min(screen.height.saturating_sub(6)).max(14);
 
     let dialog_x = screen.width.saturating_sub(dialog_width) / 2;
     let dialog_y = screen.height.saturating_sub(dialog_height) / 2;
@@ -1240,17 +1355,23 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
 
     let inner = dialog_block.inner(area);
     frame.render_widget(dialog_block, area);
-    
+
     let shortcuts = vec![
         ("", "── Navigation ──"),
         ("↑/↓", "Move selection up/down"),
-        ("Ctrl+Y/Ctrl+V", "Page up/down (explorer, dialogs, terminal)"),
+        (
+            "Ctrl+Y/Ctrl+V",
+            "Page up/down (explorer, dialogs, terminal)",
+        ),
         ("Tab", "Switch panel (local ↔ remote/connections)"),
         ("Shift+Tab", "Switch to previous panel or menu"),
         ("Enter", "Open file/folder or connect"),
         ("/", "Edit current path (Tab to autocomplete)"),
         ("/ /", "Double-tap to start from root (/)"),
-        ("Esc", "Clear file selection if any; else menu / close dialog"),
+        (
+            "Esc",
+            "Clear file selection if any; else menu / close dialog",
+        ),
         ("", ""),
         ("", "── Selection ──"),
         ("Space", "Toggle selection of current item"),
@@ -1262,7 +1383,10 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
         ("D", "Download selected (remote panel)"),
         ("U", "Upload selected (local panel)"),
         ("Z", "Zip selected files/folders"),
-        ("Z Z", "Zip selection, then queue upload (local) or download (remote)"),
+        (
+            "Z Z",
+            "Zip selection, then queue upload (local) or download (remote)",
+        ),
         ("X", "Delete all selected files/folders"),
         ("", ""),
         ("", "── Filtering ──"),
@@ -1276,13 +1400,22 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
         ("Enter/↓", "Open menu dropdown"),
         ("", ""),
         ("", "── Settings ──"),
-        ("File → Settings", "Columns, editor, terminal cwd options"),
+        (
+            "File → Settings",
+            "Columns, headers, sort, editor, terminal cwd options",
+        ),
         ("", ""),
         ("", "── Terminal ──"),
         ("`", "Toggle and focus terminal"),
         ("Esc", "Unfocus terminal"),
-        ("Ctrl+↑/Ctrl+↓", "Scroll terminal by one line (↑↓ alone: shell history)"),
-        ("Ctrl+Y/Ctrl+V", "Page up/down in terminal (matches explorer)"),
+        (
+            "Ctrl+↑/Ctrl+↓",
+            "Scroll terminal by one line (↑↓ alone: shell history)",
+        ),
+        (
+            "Ctrl+Y/Ctrl+V",
+            "Page up/down in terminal (matches explorer)",
+        ),
         ("PgUp/PgDn", "Page up/down in terminal"),
         ("", ""),
         ("", "── This Dialog ──"),
@@ -1292,7 +1425,7 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
         ("Home/End", "Jump to start/end"),
         ("Esc", "Close"),
     ];
-    
+
     let total_items = shortcuts.len();
     app.shortcuts_help_line_count = total_items;
     let visible_height = inner.height as usize;
@@ -1348,7 +1481,9 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
         } else {
             let key_span = Span::styled(
                 format!("{:>width$}", key, width = max_key_width),
-                Style::default().fg(MENU_SELECTED).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(MENU_SELECTED)
+                    .add_modifier(Modifier::BOLD),
             );
             let sep_span = Span::styled(" ", Style::default());
             let desc_span = Span::styled(*desc, Style::default().fg(TEXT));
@@ -1378,12 +1513,18 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
 
     let transfer_status = {
         let items = app.transfer_manager.get_items();
-        let active: Vec<_> = items.iter().filter(|i| {
-            matches!(i.status, crate::transfer::TransferStatus::InProgress { .. } | 
-                              crate::transfer::TransferStatus::Retrying { .. } |
-                              crate::transfer::TransferStatus::Pending)
-        }).collect();
-        
+        let active: Vec<_> = items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.status,
+                    crate::transfer::TransferStatus::InProgress { .. }
+                        | crate::transfer::TransferStatus::Retrying { .. }
+                        | crate::transfer::TransferStatus::Pending
+                )
+            })
+            .collect();
+
         if !active.is_empty() {
             format!(" {} transfers ", active.len())
         } else {
@@ -1412,7 +1553,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             AppMode::DirectoryInput => "Tab:Complete Enter:Go Esc:Cancel",
             AppMode::RenameInput => "Enter:Apply Esc:Cancel Backspace:Delete char",
             AppMode::DeleteConfirm => "←→:Select Enter:Confirm Esc:Cancel",
-            AppMode::Settings => "↑↓ Space:Toggle Enter:Edit editor Esc:Close",
+            AppMode::Settings => "↑↓ ←→ Space:Toggle/Cycle Enter:Edit/Cycle Esc:Close",
             AppMode::KeyboardShortcuts => "↑↓ j/k Ctrl+Y/V PgUp/Dn Home/End Esc:Close",
         }
     };

@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use log::{debug, error, info};
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtyPair, PtySize};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
 use ssh2::{Channel, Session};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -11,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
 use vte::{Params, Parser, Perform};
 
 use crate::transfer::SftpSessionInfo;
@@ -155,16 +155,16 @@ impl TerminalScreen {
         if cols == self.cols && rows == self.rows {
             return;
         }
-        
+
         self.cols = cols;
         self.rows = rows;
         self.scroll_bottom = rows.saturating_sub(1);
-        
+
         self.cells.resize(rows, vec![ScreenCell::default(); cols]);
         for row in &mut self.cells {
             row.resize(cols, ScreenCell::default());
         }
-        
+
         self.cursor_x = self.cursor_x.min(cols.saturating_sub(1));
         self.cursor_y = self.cursor_y.min(rows.saturating_sub(1));
     }
@@ -174,7 +174,7 @@ impl TerminalScreen {
             self.cursor_x = 0;
             self.newline();
         }
-        
+
         if self.cursor_y < self.rows && self.cursor_x < self.cols {
             self.cells[self.cursor_y][self.cursor_x].c = c;
             self.cursor_x += 1;
@@ -213,13 +213,14 @@ impl TerminalScreen {
                 }
                 self.scrollback.push(row);
             }
-            
+
             let bottom = self.scroll_bottom.min(self.rows.saturating_sub(1));
             if bottom < self.rows {
-                self.cells.insert(bottom, vec![ScreenCell::default(); self.cols]);
+                self.cells
+                    .insert(bottom, vec![ScreenCell::default(); self.cols]);
             }
         }
-        
+
         while self.cells.len() > self.rows {
             self.cells.pop();
         }
@@ -234,9 +235,10 @@ impl TerminalScreen {
             if bottom < self.cells.len() {
                 self.cells.remove(bottom);
             }
-            self.cells.insert(self.scroll_top, vec![ScreenCell::default(); self.cols]);
+            self.cells
+                .insert(self.scroll_top, vec![ScreenCell::default(); self.cols]);
         }
-        
+
         while self.cells.len() > self.rows {
             self.cells.pop();
         }
@@ -332,20 +334,26 @@ impl TerminalScreen {
     fn get_lines(&self) -> Vec<String> {
         self.cells
             .iter()
-            .map(|row| row.iter().map(|c| c.c).collect::<String>().trim_end().to_string())
+            .map(|row| {
+                row.iter()
+                    .map(|c| c.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
             .collect()
     }
 
     fn get_lines_with_scrollback(&self, visible_rows: usize, scroll_offset: usize) -> Vec<String> {
         let total_scrollback = self.scrollback.len();
-        
+
         if scroll_offset == 0 {
             return self.get_lines();
         }
-        
+
         let mut lines = Vec::with_capacity(visible_rows);
         let scroll_start = total_scrollback.saturating_sub(scroll_offset);
-        
+
         for i in scroll_start..total_scrollback {
             if lines.len() >= visible_rows {
                 break;
@@ -359,12 +367,18 @@ impl TerminalScreen {
                     .to_string(),
             );
         }
-        
+
         let remaining = visible_rows.saturating_sub(lines.len());
         for row in self.cells.iter().take(remaining) {
-            lines.push(row.iter().map(|c| c.c).collect::<String>().trim_end().to_string());
+            lines.push(
+                row.iter()
+                    .map(|c| c.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string(),
+            );
         }
-        
+
         lines
     }
 }
@@ -424,22 +438,34 @@ impl Perform for TerminalScreen {
         }
     }
 
-    fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, action: char) {
-        let params: Vec<u16> = params.iter().map(|p| p.first().copied().unwrap_or(0)).collect();
+    fn csi_dispatch(
+        &mut self,
+        params: &Params,
+        _intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) {
+        let params: Vec<u16> = params
+            .iter()
+            .map(|p| p.first().copied().unwrap_or(0))
+            .collect();
         let param = |i: usize, default: u16| params.get(i).copied().unwrap_or(default).max(1);
 
         match action {
             'A' => self.cursor_y = self.cursor_y.saturating_sub(param(0, 1) as usize),
             'B' | 'e' => {
-                self.cursor_y = (self.cursor_y + param(0, 1) as usize).min(self.rows.saturating_sub(1))
+                self.cursor_y =
+                    (self.cursor_y + param(0, 1) as usize).min(self.rows.saturating_sub(1))
             }
             'C' | 'a' => {
-                self.cursor_x = (self.cursor_x + param(0, 1) as usize).min(self.cols.saturating_sub(1))
+                self.cursor_x =
+                    (self.cursor_x + param(0, 1) as usize).min(self.cols.saturating_sub(1))
             }
             'D' => self.cursor_x = self.cursor_x.saturating_sub(param(0, 1) as usize),
             'E' => {
                 self.cursor_x = 0;
-                self.cursor_y = (self.cursor_y + param(0, 1) as usize).min(self.rows.saturating_sub(1));
+                self.cursor_y =
+                    (self.cursor_y + param(0, 1) as usize).min(self.rows.saturating_sub(1));
             }
             'F' => {
                 self.cursor_x = 0;
@@ -461,7 +487,8 @@ impl Perform for TerminalScreen {
                 let count = param(0, 1) as usize;
                 for _ in 0..count {
                     if self.cursor_y < self.rows {
-                        self.cells.insert(self.cursor_y, vec![ScreenCell::default(); self.cols]);
+                        self.cells
+                            .insert(self.cursor_y, vec![ScreenCell::default(); self.cols]);
                         let bottom = self.scroll_bottom.min(self.rows.saturating_sub(1));
                         if bottom < self.cells.len() {
                             self.cells.remove(bottom + 1);
@@ -478,7 +505,8 @@ impl Perform for TerminalScreen {
                     if self.cursor_y < self.cells.len() {
                         self.cells.remove(self.cursor_y);
                         let bottom = self.scroll_bottom.min(self.rows.saturating_sub(1));
-                        self.cells.insert(bottom, vec![ScreenCell::default(); self.cols]);
+                        self.cells
+                            .insert(bottom, vec![ScreenCell::default(); self.cols]);
                     }
                 }
             }
@@ -501,7 +529,11 @@ impl Perform for TerminalScreen {
             }
             'r' => {
                 let top = params.first().copied().unwrap_or(1).saturating_sub(1) as usize;
-                let bottom = params.get(1).copied().unwrap_or(self.rows as u16).saturating_sub(1) as usize;
+                let bottom = params
+                    .get(1)
+                    .copied()
+                    .unwrap_or(self.rows as u16)
+                    .saturating_sub(1) as usize;
                 self.scroll_top = top.min(self.rows.saturating_sub(1));
                 self.scroll_bottom = bottom.min(self.rows.saturating_sub(1));
                 self.cursor_x = 0;
@@ -552,7 +584,10 @@ impl LocalTerminal {
             .context("Failed to open PTY")?;
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        info!("Starting local terminal with shell: {} ({}x{})", shell, cols, rows);
+        info!(
+            "Starting local terminal with shell: {} ({}x{})",
+            shell, cols, rows
+        );
 
         let zdotdir = std::env::temp_dir().join("badassh-zsh");
         let _ = std::fs::create_dir_all(&zdotdir);
@@ -577,10 +612,19 @@ impl LocalTerminal {
             .spawn_command(cmd)
             .context("Failed to spawn shell")?;
 
-        let writer = pty_pair.master.take_writer().context("Failed to get PTY writer")?;
-        let mut reader = pty_pair.master.try_clone_reader().context("Failed to get PTY reader")?;
+        let writer = pty_pair
+            .master
+            .take_writer()
+            .context("Failed to get PTY writer")?;
+        let mut reader = pty_pair
+            .master
+            .try_clone_reader()
+            .context("Failed to get PTY reader")?;
 
-        let screen = Arc::new(Mutex::new(TerminalScreen::new(cols as usize, rows as usize)));
+        let screen = Arc::new(Mutex::new(TerminalScreen::new(
+            cols as usize,
+            rows as usize,
+        )));
         let running = Arc::new(AtomicBool::new(true));
         let cols_atomic = Arc::new(AtomicU16::new(cols));
         let rows_atomic = Arc::new(AtomicU16::new(rows));
@@ -708,15 +752,15 @@ impl LocalTerminal {
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
         let old_cols = self.cols.load(Ordering::SeqCst);
         let old_rows = self.rows.load(Ordering::SeqCst);
-        
+
         if cols == old_cols && rows == old_rows {
             return Ok(());
         }
-        
+
         self.cols.store(cols, Ordering::SeqCst);
         self.rows.store(rows, Ordering::SeqCst);
         self.pending_resize.store(true, Ordering::SeqCst);
-        
+
         self.pty_pair
             .master
             .resize(PtySize {
@@ -731,7 +775,10 @@ impl LocalTerminal {
 
     #[allow(dead_code)]
     pub fn size(&self) -> (u16, u16) {
-        (self.cols.load(Ordering::SeqCst), self.rows.load(Ordering::SeqCst))
+        (
+            self.cols.load(Ordering::SeqCst),
+            self.rows.load(Ordering::SeqCst),
+        )
     }
 }
 
@@ -770,8 +817,8 @@ impl RemoteTerminal {
         );
 
         let addr = format!("{}:{}", session_info.host, session_info.port);
-        let tcp = TcpStream::connect(&addr)
-            .with_context(|| format!("Failed to connect to {}", addr))?;
+        let tcp =
+            TcpStream::connect(&addr).with_context(|| format!("Failed to connect to {}", addr))?;
 
         let tcp_clone = tcp.try_clone()?;
 
@@ -816,11 +863,14 @@ impl RemoteTerminal {
             Some((cols as u32, rows as u32, 0, 0)),
         )?;
         channel.shell()?;
-        
+
         tcp_clone.set_nonblocking(true)?;
         session.set_blocking(false);
 
-        let screen = Arc::new(Mutex::new(TerminalScreen::new(cols as usize, rows as usize)));
+        let screen = Arc::new(Mutex::new(TerminalScreen::new(
+            cols as usize,
+            rows as usize,
+        )));
         let running = Arc::new(AtomicBool::new(true));
 
         let mut terminal = Self {
@@ -870,7 +920,7 @@ impl RemoteTerminal {
 
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
         self.poll_read();
-        
+
         for attempt in 0..5 {
             match self.channel.write(data) {
                 Ok(_) => {
@@ -946,11 +996,12 @@ impl RemoteTerminal {
         if cols == self.cols && rows == self.rows {
             return Ok(());
         }
-        
+
         self.cols = cols;
         self.rows = rows;
         self.screen.lock().resize(cols as usize, rows as usize);
-        self.channel.request_pty_size(cols as u32, rows as u32, Some(0), Some(0))?;
+        self.channel
+            .request_pty_size(cols as u32, rows as u32, Some(0), Some(0))?;
         Ok(())
     }
 

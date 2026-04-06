@@ -11,11 +11,14 @@ use app::{
     App, AppMode, ConnectionDialog, FilterMode, FocusPanel, TerminalFocus, SETTINGS_ROW_EDITOR,
 };
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use log::{info, error};
+use log::{error, info};
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use simplelog::{Config, LevelFilter, WriteLogger};
 use std::fs::File;
@@ -26,17 +29,17 @@ fn init_logging() -> Result<()> {
     let log_path = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("badassh");
-    
+
     std::fs::create_dir_all(&log_path)?;
-    
+
     let log_file = log_path.join("badassh.log");
     let file = File::create(&log_file)?;
-    
+
     WriteLogger::init(LevelFilter::Debug, Config::default(), file)?;
-    
+
     info!("=== badassh started ===");
     info!("Log file: {:?}", log_file);
-    
+
     Ok(())
 }
 
@@ -76,7 +79,7 @@ fn main() -> Result<()> {
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     app.update_local_watcher();
-    
+
     while app.running {
         terminal.draw(|f| ui::draw(f, app))?;
         app.check_transfers_and_refresh();
@@ -114,7 +117,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
         handle_terminal_keys(app, key);
         return;
     }
-    
+
     match app.mode {
         AppMode::Normal => handle_normal_keys(app, key),
         AppMode::MenuFocused => handle_menu_focused_keys(app, key),
@@ -334,19 +337,17 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) {
         KeyCode::BackTab => {
             app.cycle_main_focus_backward();
         }
-        _ => {
-            match app.focus {
-                app::FocusPanel::Local => handle_file_browser_keys(app, key),
-                app::FocusPanel::Remote => handle_connections_panel_keys(app, key),
-                app::FocusPanel::ConnectionTabs => {}
-            }
-        }
+        _ => match app.focus {
+            app::FocusPanel::Local => handle_file_browser_keys(app, key),
+            app::FocusPanel::Remote => handle_connections_panel_keys(app, key),
+            app::FocusPanel::ConnectionTabs => {}
+        },
     }
 }
 
 fn handle_connections_panel_keys(app: &mut App, key: KeyEvent) {
     let total_items = app.recent_connections.len() + 1;
-    
+
     match key.code {
         KeyCode::Esc => app.open_file_menu(),
         KeyCode::Up => {
@@ -488,13 +489,11 @@ fn handle_connected_keys(app: &mut App, key: KeyEvent) {
             app.cycle_main_focus_backward();
         }
         KeyCode::Char('/') => app.handle_slash_press(),
-        _ => {
-            match app.focus {
-                FocusPanel::Local => handle_local_panel_keys(app, key),
-                FocusPanel::Remote => handle_remote_panel_keys(app, key),
-                FocusPanel::ConnectionTabs => {}
-            }
-        }
+        _ => match app.focus {
+            FocusPanel::Local => handle_local_panel_keys(app, key),
+            FocusPanel::Remote => handle_remote_panel_keys(app, key),
+            FocusPanel::ConnectionTabs => {}
+        },
     }
 }
 
@@ -580,14 +579,20 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
         KeyCode::BackTab => {
             app.settings_move_up();
         }
+        KeyCode::Left => {
+            app.settings_adjust_row(false);
+        }
+        KeyCode::Right => {
+            app.settings_adjust_row(true);
+        }
         KeyCode::Char(' ') => {
-            app.settings_toggle_row();
+            app.settings_adjust_row(true);
         }
         KeyCode::Enter => {
             if app.settings_selected_index == SETTINGS_ROW_EDITOR {
                 app.settings_begin_editor_edit();
             } else {
-                app.settings_toggle_row();
+                app.settings_adjust_row(true);
             }
         }
         _ => {}
@@ -597,7 +602,7 @@ fn handle_settings_keys(app: &mut App, key: KeyEvent) {
 fn handle_local_panel_keys(app: &mut App, key: KeyEvent) {
     let page_size = app.visible_file_rows.max(1);
     let is_filtering = app.local.browser.is_filtering();
-    
+
     if is_filtering {
         match key.code {
             KeyCode::Esc => {
@@ -618,7 +623,9 @@ fn handle_local_panel_keys(app: &mut App, key: KeyEvent) {
             KeyCode::Down => {
                 app.local.browser.move_down();
             }
-            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') => {
+            KeyCode::Char(c)
+                if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') =>
+            {
                 app.refresh_focused_explorer();
             }
             KeyCode::Char(c) => {
@@ -628,17 +635,21 @@ fn handle_local_panel_keys(app: &mut App, key: KeyEvent) {
         }
         return;
     }
-    
+
     match key.code {
         KeyCode::Esc => {
             if !app.try_clear_file_panel_selection() {
                 app.open_file_menu();
             }
         }
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') => {
+        KeyCode::Char(c)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') =>
+        {
             app.refresh_focused_explorer();
         }
-        KeyCode::Char('r') | KeyCode::Char('R') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('r') | KeyCode::Char('R')
+            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             app.try_begin_rename();
         }
         KeyCode::Char(':') => app.local.browser.start_filter(FilterMode::Normal),
@@ -684,8 +695,11 @@ fn handle_local_panel_keys(app: &mut App, key: KeyEvent) {
 
 fn handle_remote_panel_keys(app: &mut App, key: KeyEvent) {
     let page_size = app.visible_file_rows.max(1);
-    let is_filtering = app.current_tab().map(|t| t.browser.is_filtering()).unwrap_or(false);
-    
+    let is_filtering = app
+        .current_tab()
+        .map(|t| t.browser.is_filtering())
+        .unwrap_or(false);
+
     if is_filtering {
         match key.code {
             KeyCode::Esc => {
@@ -716,7 +730,9 @@ fn handle_remote_panel_keys(app: &mut App, key: KeyEvent) {
                     tab.browser.move_down();
                 }
             }
-            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') => {
+            KeyCode::Char(c)
+                if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') =>
+            {
                 app.refresh_focused_explorer();
             }
             KeyCode::Char(c) => {
@@ -728,17 +744,21 @@ fn handle_remote_panel_keys(app: &mut App, key: KeyEvent) {
         }
         return;
     }
-    
+
     match key.code {
         KeyCode::Esc => {
             if !app.try_clear_file_panel_selection() {
                 app.open_file_menu();
             }
         }
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') => {
+        KeyCode::Char(c)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') =>
+        {
             app.refresh_focused_explorer();
         }
-        KeyCode::Char('r') | KeyCode::Char('R') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('r') | KeyCode::Char('R')
+            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             app.try_begin_rename();
         }
         KeyCode::Char(':') => {
@@ -805,7 +825,7 @@ fn handle_remote_panel_keys(app: &mut App, key: KeyEvent) {
 fn handle_file_browser_keys(app: &mut App, key: KeyEvent) {
     let page_size = app.visible_file_rows.max(1);
     let is_filtering = app.local.browser.is_filtering();
-    
+
     if is_filtering {
         match key.code {
             KeyCode::Esc => {
@@ -824,7 +844,9 @@ fn handle_file_browser_keys(app: &mut App, key: KeyEvent) {
             KeyCode::Down => {
                 app.local.browser.move_down();
             }
-            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') => {
+            KeyCode::Char(c)
+                if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') =>
+            {
                 app.refresh_focused_explorer();
             }
             KeyCode::Char(c) => {
@@ -834,17 +856,21 @@ fn handle_file_browser_keys(app: &mut App, key: KeyEvent) {
         }
         return;
     }
-    
+
     match key.code {
         KeyCode::Esc => {
             if !app.try_clear_file_panel_selection() {
                 app.open_file_menu();
             }
         }
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') => {
+        KeyCode::Char(c)
+            if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') =>
+        {
             app.refresh_focused_explorer();
         }
-        KeyCode::Char('r') | KeyCode::Char('R') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('r') | KeyCode::Char('R')
+            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             app.try_begin_rename();
         }
         KeyCode::Char('/') => app.handle_slash_press(),
@@ -870,7 +896,9 @@ fn handle_file_browser_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.local.browser.page_down(page_size);
         }
-        KeyCode::Enter => { let _ = app.enter_selected(); }
+        KeyCode::Enter => {
+            let _ = app.enter_selected();
+        }
         KeyCode::Char(' ') => app.local.browser.toggle_select_current(),
         KeyCode::Char('z') | KeyCode::Char('Z') => app.handle_zip_press(),
         KeyCode::Char('x') | KeyCode::Char('X') => app.show_delete_confirm(),
@@ -968,7 +996,7 @@ fn handle_mouse_click(app: &mut App, x: u16, y: u16, area: Rect) {
     ) {
         let main_area_y_start = 1;
         let main_area_y_end = area.height.saturating_sub(3);
-        
+
         if y > main_area_y_start && y < main_area_y_end {
             let mid_x = area.width / 2;
             if x < mid_x {
@@ -976,7 +1004,7 @@ fn handle_mouse_click(app: &mut App, x: u16, y: u16, area: Rect) {
             } else {
                 app.focus = FocusPanel::Remote;
             }
-            
+
             if app.mode == AppMode::DirectoryInput {
                 app.close_directory_input();
             }

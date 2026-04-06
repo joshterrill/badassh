@@ -4,7 +4,7 @@ use crate::ssh::{ConnectionParams, SshConnection};
 use crate::terminal::{LocalTerminal, RemoteTerminal};
 use crate::transfer::{create_zip, SftpSessionInfo, TransferManager, TransferStatus};
 use anyhow::Result;
-use log::{info, error, debug, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -19,11 +19,108 @@ pub enum MenuTab {
 }
 
 /// Rows in File → Settings (used for keyboard navigation).
-pub const SETTINGS_ROW_COUNT: usize = 7;
-pub const SETTINGS_ROW_EDITOR: usize = 4;
+pub const SETTINGS_ROW_COUNT: usize = 10;
+pub const SETTINGS_ROW_EDITOR: usize = 7;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExplorerSortField {
+    Name,
+    Size,
+    Permissions,
+    Modified,
+    Created,
+}
+
+impl Default for ExplorerSortField {
+    fn default() -> Self {
+        Self::Name
+    }
+}
+
+impl ExplorerSortField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Size,
+            Self::Size => Self::Permissions,
+            Self::Permissions => Self::Modified,
+            Self::Modified => Self::Created,
+            Self::Created => Self::Name,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Name => Self::Created,
+            Self::Size => Self::Name,
+            Self::Permissions => Self::Size,
+            Self::Modified => Self::Permissions,
+            Self::Created => Self::Modified,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Size => "Size",
+            Self::Permissions => "Permissions",
+            Self::Modified => "Last modified",
+            Self::Created => "Created",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExplorerSortDirection {
+    Ascending,
+    Descending,
+}
+
+impl Default for ExplorerSortDirection {
+    fn default() -> Self {
+        Self::Ascending
+    }
+}
+
+impl ExplorerSortDirection {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Ascending => Self::Descending,
+            Self::Descending => Self::Ascending,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        self.next()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ascending => "Ascending",
+            Self::Descending => "Descending",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ExplorerSort {
+    pub field: ExplorerSortField,
+    pub direction: ExplorerSortDirection,
+}
+
+impl Default for ExplorerSort {
+    fn default() -> Self {
+        Self {
+            field: ExplorerSortField::Name,
+            direction: ExplorerSortDirection::Ascending,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ExplorerColumns {
+    pub show_headers: bool,
     pub show_size: bool,
     pub show_permissions: bool,
     pub show_modified: bool,
@@ -33,6 +130,7 @@ pub struct ExplorerColumns {
 impl Default for ExplorerColumns {
     fn default() -> Self {
         Self {
+            show_headers: true,
             show_size: true,
             show_permissions: true,
             show_modified: true,
@@ -44,6 +142,7 @@ impl Default for ExplorerColumns {
 #[derive(Debug, Clone)]
 pub struct UserPreferences {
     pub explorer_columns: ExplorerColumns,
+    pub explorer_sort: ExplorerSort,
     pub editor_command: String,
     /// When true, new or synced terminals start in the same directory as the file explorer.
     pub open_terminal_in_explorer_dir: bool,
@@ -71,8 +170,13 @@ impl UserPreferences {
             .get_setting("explorer_columns")?
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        let explorer_sort = db
+            .get_setting("explorer_sort")?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
         Ok(Self {
             explorer_columns,
+            explorer_sort,
             editor_command,
             open_terminal_in_explorer_dir,
             explorer_follows_terminal,
@@ -100,6 +204,10 @@ impl UserPreferences {
         db.set_setting(
             "explorer_columns",
             &serde_json::to_string(&self.explorer_columns)?,
+        )?;
+        db.set_setting(
+            "explorer_sort",
+            &serde_json::to_string(&self.explorer_sort)?,
         )?;
         Ok(())
     }
@@ -144,7 +252,7 @@ impl DialogField {
             Self::KeyPath => Self::Name,
         }
     }
-    
+
     pub fn prev(self) -> Self {
         match self {
             Self::Name => Self::KeyPath,
@@ -182,7 +290,7 @@ impl ConnectionDialog {
             ..Default::default()
         }
     }
-    
+
     pub fn get_field_value(&self, field: DialogField) -> &str {
         match field {
             DialogField::Name => &self.name,
@@ -193,7 +301,7 @@ impl ConnectionDialog {
             DialogField::KeyPath => &self.key_path,
         }
     }
-    
+
     pub fn get_field_value_mut(&mut self, field: DialogField) -> &mut String {
         match field {
             DialogField::Name => &mut self.name,
@@ -204,25 +312,35 @@ impl ConnectionDialog {
             DialogField::KeyPath => &mut self.key_path,
         }
     }
-    
+
     pub fn to_connection_params(&self) -> Result<ConnectionParams> {
-        let port: u16 = self.port.parse()
+        let port: u16 = self
+            .port
+            .parse()
             .map_err(|_| anyhow::anyhow!("Invalid port number"))?;
-        
+
         if self.host.is_empty() {
             anyhow::bail!("Host is required");
         }
-        
+
         if self.username.is_empty() {
             anyhow::bail!("Username is required");
         }
-        
+
         Ok(ConnectionParams {
             host: self.host.clone(),
             port,
             username: self.username.clone(),
-            password: if self.password.is_empty() { None } else { Some(self.password.clone()) },
-            key_path: if self.key_path.is_empty() { None } else { Some(self.key_path.clone()) },
+            password: if self.password.is_empty() {
+                None
+            } else {
+                Some(self.password.clone())
+            },
+            key_path: if self.key_path.is_empty() {
+                None
+            } else {
+                Some(self.key_path.clone())
+            },
         })
     }
 }
@@ -255,6 +373,7 @@ pub struct FileEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: String,
+    pub size_bytes: Option<u64>,
     pub permissions: String,
     pub modified: String,
     pub created: Option<String>,
@@ -270,6 +389,7 @@ pub enum FilterMode {
 pub struct FileBrowser {
     pub current_dir: String,
     pub files: Vec<FileEntry>,
+    pub sort: ExplorerSort,
     pub selected_index: usize,
     pub scroll_offset: usize,
     pub selected_indices: HashSet<usize>,
@@ -280,10 +400,11 @@ pub struct FileBrowser {
 }
 
 impl FileBrowser {
-    pub fn new(start_dir: String) -> Self {
+    pub fn new(start_dir: String, sort: ExplorerSort) -> Self {
         Self {
             current_dir: start_dir,
             files: Vec::new(),
+            sort,
             selected_index: 0,
             scroll_offset: 0,
             selected_indices: HashSet::new(),
@@ -293,18 +414,62 @@ impl FileBrowser {
             filter_mode: FilterMode::None,
         }
     }
-    
+
+    pub fn sort_files(&mut self) {
+        let selected_name = self.selected_file().map(|file| file.name.clone());
+        let selected_names: HashSet<String> = self
+            .selected_indices
+            .iter()
+            .filter_map(|&idx| self.files.get(idx).map(|file| file.name.clone()))
+            .collect();
+
+        sort_file_entries(&mut self.files, self.sort);
+
+        self.selected_indices = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| selected_names.contains(&file.name))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        let filtered_len = self.filtered_len();
+        if let Some(name) = selected_name {
+            if self.filter.is_empty() {
+                if let Some(idx) = self.files.iter().position(|file| file.name == name) {
+                    self.selected_index = idx;
+                } else {
+                    self.selected_index =
+                        self.selected_index.min(self.files.len().saturating_sub(1));
+                }
+            } else {
+                if let Some((idx, _)) = self
+                    .filtered_files()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (_, file))| file.name == name)
+                {
+                    self.selected_index = idx;
+                } else {
+                    self.selected_index = self.selected_index.min(filtered_len.saturating_sub(1));
+                }
+            }
+        } else {
+            self.selected_index = self.selected_index.min(filtered_len.saturating_sub(1));
+        }
+    }
+
     pub fn start_filter(&mut self, mode: FilterMode) {
         self.filter_mode = mode;
         self.filter.clear();
         self.selected_index = 0;
         self.scroll_offset = 0;
     }
-    
+
     pub fn is_filtering(&self) -> bool {
         self.filter_mode != FilterMode::None
     }
-    
+
     pub fn filtered_files(&self) -> Vec<(usize, &FileEntry)> {
         if self.filter.is_empty() || self.filter_mode == FilterMode::None {
             self.files.iter().enumerate().collect()
@@ -333,28 +498,28 @@ impl FileBrowser {
             }
         }
     }
-    
+
     pub fn add_filter_char(&mut self, c: char) {
         self.filter.push(c);
         self.selected_index = 0;
         self.scroll_offset = 0;
     }
-    
+
     pub fn remove_filter_char(&mut self) {
         self.filter.pop();
     }
-    
+
     pub fn clear_filter(&mut self) {
         self.filter.clear();
         self.filter_mode = FilterMode::None;
         self.selected_index = 0;
         self.scroll_offset = 0;
     }
-    
+
     fn filtered_len(&self) -> usize {
         self.filtered_files().len()
     }
-    
+
     pub fn selected_file(&self) -> Option<&FileEntry> {
         if self.filter.is_empty() {
             self.files.get(self.selected_index)
@@ -364,7 +529,7 @@ impl FileBrowser {
                 .map(|(_, file)| *file)
         }
     }
-    
+
     pub fn selected_original_index(&self) -> Option<usize> {
         if self.filter.is_empty() {
             Some(self.selected_index)
@@ -374,7 +539,7 @@ impl FileBrowser {
                 .map(|(orig_idx, _)| *orig_idx)
         }
     }
-    
+
     pub fn move_up(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
@@ -382,7 +547,7 @@ impl FileBrowser {
         self.shift_selecting = false;
         self.shift_anchor = None;
     }
-    
+
     pub fn move_down(&mut self) {
         let max_idx = if self.filter.is_empty() {
             self.files.len().saturating_sub(1)
@@ -395,13 +560,13 @@ impl FileBrowser {
         self.shift_selecting = false;
         self.shift_anchor = None;
     }
-    
+
     pub fn page_up(&mut self, page_size: usize) {
         self.selected_index = self.selected_index.saturating_sub(page_size);
         self.shift_selecting = false;
         self.shift_anchor = None;
     }
-    
+
     pub fn page_down(&mut self, page_size: usize) {
         let max_idx = if self.filter.is_empty() {
             self.files.len().saturating_sub(1)
@@ -412,14 +577,14 @@ impl FileBrowser {
         self.shift_selecting = false;
         self.shift_anchor = None;
     }
-    
+
     pub fn move_up_shift(&mut self) {
         if self.selected_index == 0 {
             return;
         }
-        
+
         let orig_idx = self.selected_original_index();
-        
+
         if !self.shift_selecting {
             self.shift_selecting = true;
             self.shift_anchor = orig_idx;
@@ -427,11 +592,11 @@ impl FileBrowser {
                 self.selected_indices.insert(idx);
             }
         }
-        
+
         self.selected_index -= 1;
-        
+
         let new_orig_idx = self.selected_original_index();
-        
+
         if let (Some(anchor), Some(new_idx)) = (self.shift_anchor, new_orig_idx) {
             if new_idx < anchor {
                 self.selected_indices.insert(new_idx);
@@ -440,20 +605,20 @@ impl FileBrowser {
             }
         }
     }
-    
+
     pub fn move_down_shift(&mut self) {
         let max_idx = if self.filter.is_empty() {
             self.files.len().saturating_sub(1)
         } else {
             self.filtered_len().saturating_sub(1)
         };
-        
+
         if self.selected_index >= max_idx {
             return;
         }
-        
+
         let orig_idx = self.selected_original_index();
-        
+
         if !self.shift_selecting {
             self.shift_selecting = true;
             self.shift_anchor = orig_idx;
@@ -461,11 +626,11 @@ impl FileBrowser {
                 self.selected_indices.insert(idx);
             }
         }
-        
+
         self.selected_index += 1;
-        
+
         let new_orig_idx = self.selected_original_index();
-        
+
         if let (Some(anchor), Some(new_idx)) = (self.shift_anchor, new_orig_idx) {
             if new_idx > anchor {
                 self.selected_indices.insert(new_idx);
@@ -474,7 +639,7 @@ impl FileBrowser {
             }
         }
     }
-    
+
     pub fn toggle_select_current(&mut self) {
         if let Some(orig_idx) = self.selected_original_index() {
             if self.selected_indices.contains(&orig_idx) {
@@ -486,13 +651,13 @@ impl FileBrowser {
         self.shift_selecting = false;
         self.shift_anchor = None;
     }
-    
+
     pub fn clear_selection(&mut self) {
         self.selected_indices.clear();
         self.shift_selecting = false;
         self.shift_anchor = None;
     }
-    
+
     pub fn get_selected_files(&self) -> Vec<&FileEntry> {
         if self.selected_indices.is_empty() {
             self.selected_file().into_iter().collect()
@@ -515,11 +680,11 @@ impl FileBrowser {
         }
         self.selected_file()
     }
-    
+
     pub fn is_selected(&self, index: usize) -> bool {
         self.selected_indices.contains(&index)
     }
-    
+
     #[allow(dead_code)]
     pub fn adjust_scroll(&mut self, visible_height: usize) {
         if self.selected_index < self.scroll_offset {
@@ -530,144 +695,164 @@ impl FileBrowser {
     }
 }
 
+fn compare_file_entries(a: &FileEntry, b: &FileEntry, sort: ExplorerSort) -> std::cmp::Ordering {
+    if a.name == ".." && b.name != ".." {
+        return std::cmp::Ordering::Less;
+    }
+    if a.name != ".." && b.name == ".." {
+        return std::cmp::Ordering::Greater;
+    }
+
+    let primary = match sort.field {
+        ExplorerSortField::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        ExplorerSortField::Size => a.size_bytes.cmp(&b.size_bytes),
+        ExplorerSortField::Permissions => a.permissions.cmp(&b.permissions),
+        ExplorerSortField::Modified => a.modified.cmp(&b.modified),
+        ExplorerSortField::Created => a.created.as_deref().cmp(&b.created.as_deref()),
+    };
+
+    let ordered = match sort.direction {
+        ExplorerSortDirection::Ascending => primary,
+        ExplorerSortDirection::Descending => primary.reverse(),
+    };
+
+    ordered.then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+}
+
+fn sort_file_entries(files: &mut [FileEntry], sort: ExplorerSort) {
+    files.sort_by(|a, b| compare_file_entries(a, b, sort));
+}
+
 pub struct LocalBrowser {
     pub browser: FileBrowser,
 }
 
 impl LocalBrowser {
-    pub fn new() -> Result<Self> {
-        let current_dir = std::env::current_dir()?
-            .to_string_lossy()
-            .to_string();
-        
-        let mut browser = FileBrowser::new(current_dir);
+    pub fn new(sort: ExplorerSort) -> Result<Self> {
+        let current_dir = std::env::current_dir()?.to_string_lossy().to_string();
+
+        let mut browser = FileBrowser::new(current_dir, sort);
         Self::refresh_files(&mut browser)?;
-        
+
         Ok(Self { browser })
     }
-    
+
     pub fn refresh_files(browser: &mut FileBrowser) -> Result<()> {
         let prev_index = browser.selected_index;
         browser.files.clear();
         browser.clear_selection();
-        
+
         browser.files.push(FileEntry {
             name: "..".to_string(),
             is_dir: true,
             size: "-".to_string(),
+            size_bytes: None,
             permissions: "drwxr-xr-x".to_string(),
             modified: "".to_string(),
             created: None,
         });
-        
+
         let entries = std::fs::read_dir(&browser.current_dir)?;
-        
+
         for entry in entries.flatten() {
             let metadata = entry.metadata()?;
             let name = entry.file_name().to_string_lossy().to_string();
-            
+
             if name.starts_with('.') {
                 continue;
             }
-            
+
             let is_dir = metadata.is_dir();
             let size = if is_dir {
                 "-".to_string()
             } else {
                 Self::format_size(metadata.len())
             };
-            
+            let size_bytes = if is_dir { None } else { Some(metadata.len()) };
+
             let permissions = Self::format_permissions(&metadata);
             let modified = Self::format_modified(&metadata);
             let created = Self::format_created(&metadata);
-            
+
             browser.files.push(FileEntry {
                 name,
                 is_dir,
                 size,
+                size_bytes,
                 permissions,
                 modified,
                 created,
             });
         }
-        
-        browser.files[1..].sort_by(|a, b| {
-            match (a.is_dir, b.is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            }
-        });
-        
+
+        browser.sort_files();
+
         browser.selected_index = prev_index.min(browser.files.len().saturating_sub(1));
-        
+
         Ok(())
     }
-    
+
     pub fn refresh_files_reset_index(browser: &mut FileBrowser) -> Result<()> {
         browser.files.clear();
         browser.clear_selection();
-        
+
         browser.files.push(FileEntry {
             name: "..".to_string(),
             is_dir: true,
             size: "-".to_string(),
+            size_bytes: None,
             permissions: "drwxr-xr-x".to_string(),
             modified: "".to_string(),
             created: None,
         });
-        
+
         let entries = std::fs::read_dir(&browser.current_dir)?;
-        
+
         for entry in entries.flatten() {
             let metadata = entry.metadata()?;
             let name = entry.file_name().to_string_lossy().to_string();
-            
+
             if name.starts_with('.') {
                 continue;
             }
-            
+
             let is_dir = metadata.is_dir();
             let size = if is_dir {
                 "-".to_string()
             } else {
                 Self::format_size(metadata.len())
             };
-            
+            let size_bytes = if is_dir { None } else { Some(metadata.len()) };
+
             let permissions = Self::format_permissions(&metadata);
             let modified = Self::format_modified(&metadata);
             let created = Self::format_created(&metadata);
-            
+
             browser.files.push(FileEntry {
                 name,
                 is_dir,
                 size,
+                size_bytes,
                 permissions,
                 modified,
                 created,
             });
         }
-        
-        browser.files[1..].sort_by(|a, b| {
-            match (a.is_dir, b.is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            }
-        });
-        
+
+        browser.sort_files();
+
         browser.selected_index = 0;
         browser.scroll_offset = 0;
-        
+
         Ok(())
     }
-    
+
     fn format_size(bytes: u64) -> String {
         const KB: u64 = 1024;
         const MB: u64 = KB * 1024;
         const GB: u64 = MB * 1024;
         const TB: u64 = GB * 1024;
-        
+
         if bytes >= TB {
             format!("{:.1}T", bytes as f64 / TB as f64)
         } else if bytes >= GB {
@@ -680,12 +865,12 @@ impl LocalBrowser {
             format!("{}B", bytes)
         }
     }
-    
+
     fn format_permissions(metadata: &std::fs::Metadata) -> String {
         use std::os::unix::fs::PermissionsExt;
         let mode = metadata.permissions().mode();
         let file_type = if metadata.is_dir() { 'd' } else { '-' };
-        
+
         let perms = [
             if mode & 0o400 != 0 { 'r' } else { '-' },
             if mode & 0o200 != 0 { 'w' } else { '-' },
@@ -697,10 +882,10 @@ impl LocalBrowser {
             if mode & 0o002 != 0 { 'w' } else { '-' },
             if mode & 0o001 != 0 { 'x' } else { '-' },
         ];
-        
+
         format!("{}{}", file_type, perms.iter().collect::<String>())
     }
-    
+
     fn format_modified(metadata: &std::fs::Metadata) -> String {
         if let Ok(modified) = metadata.modified() {
             let datetime: chrono::DateTime<chrono::Local> = modified.into();
@@ -709,14 +894,14 @@ impl LocalBrowser {
             "".to_string()
         }
     }
-    
+
     fn format_created(metadata: &std::fs::Metadata) -> Option<String> {
         metadata.created().ok().map(|created| {
             let datetime: chrono::DateTime<chrono::Local> = created.into();
             datetime.format("%Y-%m-%d %H:%M").to_string()
         })
     }
-    
+
     pub fn change_directory(browser: &mut FileBrowser, path: &str) -> Result<()> {
         let new_dir = if path == ".." {
             std::path::Path::new(&browser.current_dir)
@@ -726,8 +911,8 @@ impl LocalBrowser {
         } else if path.starts_with('/') {
             path.to_string()
         } else if path.starts_with('~') {
-            let home = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+            let home =
+                dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
             if path == "~" {
                 home.to_string_lossy().to_string()
             } else {
@@ -739,17 +924,17 @@ impl LocalBrowser {
                 .to_string_lossy()
                 .to_string()
         };
-        
+
         if !std::path::Path::new(&new_dir).is_dir() {
             anyhow::bail!("Not a directory: {}", new_dir);
         }
-        
+
         browser.current_dir = new_dir;
         Self::refresh_files_reset_index(browser)?;
-        
+
         Ok(())
     }
-    
+
     #[allow(dead_code)]
     pub fn open_file(path: &str) -> Result<()> {
         #[cfg(target_os = "macos")]
@@ -762,7 +947,7 @@ impl LocalBrowser {
         }
         Ok(())
     }
-    
+
     #[allow(dead_code)]
     pub fn execute_command(current_dir: &str, command: &str) -> Result<Option<String>> {
         let output = Command::new("sh")
@@ -770,14 +955,14 @@ impl LocalBrowser {
             .arg(command)
             .current_dir(current_dir)
             .output()?;
-        
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             if !stderr.is_empty() {
                 return Ok(Some(stderr));
             }
         }
-        
+
         Ok(None)
     }
 }
@@ -794,90 +979,88 @@ pub struct ConnectionTab {
 }
 
 impl ConnectionTab {
-    pub fn new(id: usize, name: String, connection: SshConnection, session_info: SftpSessionInfo) -> Self {
+    pub fn new(
+        id: usize,
+        name: String,
+        connection: SshConnection,
+        session_info: SftpSessionInfo,
+        sort: ExplorerSort,
+    ) -> Self {
         Self {
             id,
             name,
             connection,
-            browser: FileBrowser::new(String::new()),
+            browser: FileBrowser::new(String::new(), sort),
             session_info,
             remote_terminal: None,
             remote_terminal_visible: false,
         }
     }
-    
+
     pub fn refresh_directory(&mut self) -> Result<()> {
         if self.browser.current_dir.is_empty() {
             self.browser.current_dir = self.connection.get_remote_pwd()?;
         }
-        
+
         let prev_index = self.browser.selected_index;
-        let output = self.connection.exec(&format!("ls -la {}", &self.browser.current_dir))?;
-        
+        let output = self
+            .connection
+            .exec(&format!("ls -la {}", &self.browser.current_dir))?;
+
         self.browser.files.clear();
         self.browser.clear_selection();
-        
+
         for line in output.lines().skip(1) {
             if let Some(entry) = Self::parse_ls_line(line) {
                 self.browser.files.push(entry);
             }
         }
-        
-        self.browser.files.sort_by(|a, b| {
-            match (a.is_dir, b.is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            }
-        });
-        
+
+        self.browser.sort_files();
+
         self.browser.selected_index = prev_index.min(self.browser.files.len().saturating_sub(1));
-        
+
         Ok(())
     }
-    
+
     pub fn refresh_directory_reset_index(&mut self) -> Result<()> {
         if self.browser.current_dir.is_empty() {
             self.browser.current_dir = self.connection.get_remote_pwd()?;
         }
-        
-        let output = self.connection.exec(&format!("ls -la {}", &self.browser.current_dir))?;
-        
+
+        let output = self
+            .connection
+            .exec(&format!("ls -la {}", &self.browser.current_dir))?;
+
         self.browser.files.clear();
         self.browser.clear_selection();
-        
+
         for line in output.lines().skip(1) {
             if let Some(entry) = Self::parse_ls_line(line) {
                 self.browser.files.push(entry);
             }
         }
-        
-        self.browser.files.sort_by(|a, b| {
-            match (a.is_dir, b.is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            }
-        });
-        
+
+        self.browser.sort_files();
+
         self.browser.selected_index = 0;
         self.browser.scroll_offset = 0;
-        
+
         Ok(())
     }
-    
+
     fn parse_ls_line(line: &str) -> Option<FileEntry> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 8 {
             return None;
         }
-        
+
         let permissions = parts[0].to_string();
-        
+
         if permissions == "total" || permissions.len() < 10 {
             return None;
         }
-        
+
         let is_dir = permissions.starts_with('d');
         let size_bytes = parts.get(4).unwrap_or(&"0").parse::<u64>().unwrap_or(0);
         let size = if is_dir {
@@ -885,14 +1068,14 @@ impl ConnectionTab {
         } else {
             Self::format_size_human(size_bytes)
         };
-        
+
         let modified = format!(
-            "{} {} {}", 
+            "{} {} {}",
             parts.get(5).unwrap_or(&""),
             parts.get(6).unwrap_or(&""),
             parts.get(7).unwrap_or(&"")
         );
-        
+
         let name = if parts.len() > 8 {
             parts[8..].join(" ")
         } else if parts.len() == 8 {
@@ -900,33 +1083,34 @@ impl ConnectionTab {
         } else {
             return None;
         };
-        
+
         if name == "." {
             return None;
         }
-        
+
         let name = if let Some(pos) = name.find(" -> ") {
             name[..pos].to_string()
         } else {
             name
         };
-        
+
         Some(FileEntry {
             name,
             is_dir,
             size,
+            size_bytes: if is_dir { None } else { Some(size_bytes) },
             permissions,
             modified,
             created: None,
         })
     }
-    
+
     fn format_size_human(bytes: u64) -> String {
         const KB: u64 = 1024;
         const MB: u64 = KB * 1024;
         const GB: u64 = MB * 1024;
         const TB: u64 = GB * 1024;
-        
+
         if bytes >= TB {
             format!("{:.1}T", bytes as f64 / TB as f64)
         } else if bytes >= GB {
@@ -939,40 +1123,40 @@ impl ConnectionTab {
             format!("{}B", bytes)
         }
     }
-    
+
     pub fn change_directory(&mut self, path: &str) -> Result<()> {
         let cd_command = if path.starts_with('/') || path.starts_with('~') {
             format!("cd {} && pwd", path)
         } else {
             format!("cd \"{}\" && cd {} && pwd", &self.browser.current_dir, path)
         };
-        
+
         debug!("Remote cd command: {}", cd_command);
-        
+
         let result = self.connection.exec(&cd_command)?;
         let new_path = result.trim().to_string();
-        
+
         if new_path.is_empty() {
             anyhow::bail!("Failed to change directory to: {}", path);
         }
-        
+
         self.browser.current_dir = new_path;
         self.refresh_directory_reset_index()?;
-        
+
         Ok(())
     }
-    
+
     #[allow(dead_code)]
     pub fn execute_command(&mut self, command: &str) -> Result<Option<String>> {
         let full_cmd = format!("cd {} && {} 2>&1", &self.browser.current_dir, command);
         debug!("Remote execute: {}", full_cmd);
-        
+
         let output = self.connection.exec(&full_cmd)?;
-        
+
         if !output.trim().is_empty() {
             info!("Remote command output:\n{}", output);
         }
-        
+
         let trimmed = command.trim();
         if trimmed.starts_with("cd ") || trimmed == "cd" {
             let path = trimmed.strip_prefix("cd").unwrap_or("").trim();
@@ -981,12 +1165,17 @@ impl ConnectionTab {
         } else if trimmed.contains("&&") || trimmed.contains(";") {
             let _ = self.refresh_directory();
         }
-        
+
         let lower = output.to_lowercase();
-        if lower.contains("error") || lower.contains("not found") || 
-           lower.contains("permission denied") || lower.contains("no such") ||
-           lower.contains("command not found") || lower.contains("cannot") ||
-           lower.contains("failed") || lower.contains("denied") {
+        if lower.contains("error")
+            || lower.contains("not found")
+            || lower.contains("permission denied")
+            || lower.contains("no such")
+            || lower.contains("command not found")
+            || lower.contains("cannot")
+            || lower.contains("failed")
+            || lower.contains("denied")
+        {
             warn!("Remote command may have errors: {}", output.trim());
             Ok(Some(output.trim().to_string()))
         } else {
@@ -1062,10 +1251,10 @@ impl App {
         let db = Database::new()?;
         let all_connections = db.get_all_connections()?;
         let recent_connections = db.get_recent_connections(10)?;
-        let local = LocalBrowser::new()?;
         let default_editor = detect_default_editor();
         let preferences = UserPreferences::load_from_db(&db, &default_editor)?;
-        
+        let local = LocalBrowser::new(preferences.explorer_sort)?;
+
         Ok(Self {
             running: true,
             mode: AppMode::Normal,
@@ -1114,16 +1303,16 @@ impl App {
             terminal_focus: TerminalFocus::None,
         })
     }
-    
+
     pub fn quit(&mut self) {
         self.running = false;
     }
-    
+
     #[allow(dead_code)]
     pub fn focus_menu(&mut self) {
         self.mode = AppMode::MenuFocused;
     }
-    
+
     /// Clears Space / Shift+arrow multi-selection on the focused file panel. Returns `true` if a selection existed.
     pub fn try_clear_file_panel_selection(&mut self) -> bool {
         match self.focus {
@@ -1156,13 +1345,13 @@ impl App {
         self.file_menu_index = 0;
         self.mode = AppMode::MenuFocused;
     }
-    
+
     pub fn open_dropdown(&mut self) {
         if self.mode == AppMode::MenuFocused {
             self.mode = AppMode::MenuOpen;
         }
     }
-    
+
     pub fn close_menu(&mut self) {
         self.mode = if !self.tabs.is_empty() {
             AppMode::Connected
@@ -1170,7 +1359,7 @@ impl App {
             AppMode::Normal
         };
     }
-    
+
     pub fn next_menu_tab(&mut self) {
         self.active_menu_tab = match self.active_menu_tab {
             MenuTab::File => MenuTab::Connect,
@@ -1178,7 +1367,7 @@ impl App {
             MenuTab::Help => MenuTab::File,
         };
     }
-    
+
     pub fn prev_menu_tab(&mut self) {
         self.active_menu_tab = match self.active_menu_tab {
             MenuTab::File => MenuTab::Help,
@@ -1186,7 +1375,7 @@ impl App {
             MenuTab::Help => MenuTab::Connect,
         };
     }
-    
+
     pub fn menu_down(&mut self) {
         match self.active_menu_tab {
             MenuTab::File => {
@@ -1200,61 +1389,57 @@ impl App {
             }
         }
     }
-    
+
     pub fn menu_up(&mut self) {
         match self.active_menu_tab {
             MenuTab::File => {
-                self.file_menu_index = if self.file_menu_index == 0 {
-                    1
-                } else {
-                    0
-                };
+                self.file_menu_index = if self.file_menu_index == 0 { 1 } else { 0 };
             }
             MenuTab::Connect => {
-                self.connect_menu_index = if self.connect_menu_index == 0 { 2 } else { self.connect_menu_index - 1 };
+                self.connect_menu_index = if self.connect_menu_index == 0 {
+                    2
+                } else {
+                    self.connect_menu_index - 1
+                };
             }
             MenuTab::Help => {
                 self.help_menu_index = 0;
             }
         }
     }
-    
+
     pub fn select_menu_item(&mut self) {
         match self.active_menu_tab {
-            MenuTab::File => {
-                match self.file_menu_index {
-                    0 => self.open_settings(),
-                    1 => self.quit(),
-                    _ => {}
+            MenuTab::File => match self.file_menu_index {
+                0 => self.open_settings(),
+                1 => self.quit(),
+                _ => {}
+            },
+            MenuTab::Connect => match self.connect_menu_index {
+                0 => {
+                    self.connection_dialog = ConnectionDialog::new();
+                    self.mode = AppMode::ConnectionDialog;
                 }
-            }
-            MenuTab::Connect => {
-                match self.connect_menu_index {
-                    0 => {
-                        self.connection_dialog = ConnectionDialog::new();
-                        self.mode = AppMode::ConnectionDialog;
-                    }
-                    1 => {
-                        self.showing_recent = true;
-                        self.connection_list_index = 0;
-                        self.refresh_connections();
-                        self.mode = AppMode::ConnectionList;
-                    }
-                    2 => {
-                        self.showing_recent = false;
-                        self.connection_list_index = 0;
-                        self.refresh_connections();
-                        self.mode = AppMode::ConnectionList;
-                    }
-                    _ => {}
+                1 => {
+                    self.showing_recent = true;
+                    self.connection_list_index = 0;
+                    self.refresh_connections();
+                    self.mode = AppMode::ConnectionList;
                 }
-            }
+                2 => {
+                    self.showing_recent = false;
+                    self.connection_list_index = 0;
+                    self.refresh_connections();
+                    self.mode = AppMode::ConnectionList;
+                }
+                _ => {}
+            },
             MenuTab::Help => {
                 self.mode = AppMode::KeyboardShortcuts;
             }
         }
     }
-    
+
     pub fn close_keyboard_shortcuts(&mut self) {
         self.shortcuts_scroll_offset = 0;
         self.mode = if !self.tabs.is_empty() {
@@ -1263,11 +1448,11 @@ impl App {
             AppMode::Normal
         };
     }
-    
+
     pub fn shortcuts_scroll_up(&mut self) {
         self.shortcuts_scroll_offset = self.shortcuts_scroll_offset.saturating_sub(1);
     }
-    
+
     pub fn shortcuts_scroll_down(&mut self, max_items: usize, visible_height: usize) {
         let vh = visible_height.max(1);
         if max_items > vh {
@@ -1301,7 +1486,7 @@ impl App {
             self.zip_selected();
         }
     }
-    
+
     fn effective_local_terminal_dir(&self) -> String {
         if self.preferences.open_terminal_in_explorer_dir {
             self.local.browser.current_dir.clone()
@@ -1343,6 +1528,16 @@ impl App {
         }
     }
 
+    fn apply_explorer_sort_preferences(&mut self) {
+        let sort = self.preferences.explorer_sort;
+        self.local.browser.sort = sort;
+        self.local.browser.sort_files();
+        for tab in &mut self.tabs {
+            tab.browser.sort = sort;
+            tab.browser.sort_files();
+        }
+    }
+
     pub fn settings_move_up(&mut self) {
         if self.settings_editing_editor {
             return;
@@ -1361,43 +1556,62 @@ impl App {
         }
     }
 
-    pub fn settings_toggle_row(&mut self) {
+    pub fn settings_adjust_row(&mut self, forward: bool) {
         if self.settings_editing_editor {
             return;
         }
         match self.settings_selected_index {
             0 => {
+                self.preferences.explorer_columns.show_headers =
+                    !self.preferences.explorer_columns.show_headers
+            }
+            1 => {
                 self.preferences.explorer_columns.show_size =
                     !self.preferences.explorer_columns.show_size
             }
-            1 => {
+            2 => {
                 self.preferences.explorer_columns.show_permissions =
                     !self.preferences.explorer_columns.show_permissions
             }
-            2 => {
+            3 => {
                 self.preferences.explorer_columns.show_modified =
                     !self.preferences.explorer_columns.show_modified
             }
-            3 => {
+            4 => {
                 self.preferences.explorer_columns.show_created =
                     !self.preferences.explorer_columns.show_created
             }
-            4 => {
-                self.settings_begin_editor_edit();
-            }
             5 => {
+                self.preferences.explorer_sort.field = if forward {
+                    self.preferences.explorer_sort.field.next()
+                } else {
+                    self.preferences.explorer_sort.field.prev()
+                };
+            }
+            6 => {
+                self.preferences.explorer_sort.direction = if forward {
+                    self.preferences.explorer_sort.direction.next()
+                } else {
+                    self.preferences.explorer_sort.direction.prev()
+                };
+            }
+            7 => {
+                return;
+            }
+            8 => {
                 self.preferences.open_terminal_in_explorer_dir =
                     !self.preferences.open_terminal_in_explorer_dir
             }
-            6 => {
+            9 => {
                 self.preferences.explorer_follows_terminal =
                     !self.preferences.explorer_follows_terminal
             }
-            _ => {}
+            _ => return,
         }
-        if matches!(self.settings_selected_index, 0..=6) {
-            self.persist_preferences();
+        if matches!(self.settings_selected_index, 5 | 6) {
+            self.apply_explorer_sort_preferences();
         }
+        self.persist_preferences();
     }
 
     pub fn settings_begin_editor_edit(&mut self) {
@@ -1439,7 +1653,9 @@ impl App {
                     if cwd.is_dir() {
                         let cwd_str = cwd.to_string_lossy().to_string();
                         if cwd_str != self.local.browser.current_dir {
-                            if LocalBrowser::change_directory(&mut self.local.browser, &cwd_str).is_ok() {
+                            if LocalBrowser::change_directory(&mut self.local.browser, &cwd_str)
+                                .is_ok()
+                            {
                                 self.update_local_watcher();
                             }
                         }
@@ -1466,7 +1682,7 @@ impl App {
 
     pub fn toggle_local_terminal(&mut self) {
         self.local_terminal_visible = !self.local_terminal_visible;
-        
+
         if self.local_terminal_visible {
             let current_dir = self.effective_local_terminal_dir();
             if let Some(term) = self.local_terminal.as_mut() {
@@ -1489,14 +1705,16 @@ impl App {
                 }
             }
         }
-        
+
         if self.local_terminal_visible && self.focus == FocusPanel::Local {
             self.terminal_focus = TerminalFocus::LocalTerminal;
-        } else if !self.local_terminal_visible && self.terminal_focus == TerminalFocus::LocalTerminal {
+        } else if !self.local_terminal_visible
+            && self.terminal_focus == TerminalFocus::LocalTerminal
+        {
             self.terminal_focus = TerminalFocus::None;
         }
     }
-    
+
     pub fn toggle_remote_terminal(&mut self) {
         let active_tab = self.active_tab;
         if let Some(tab) = self.tabs.get_mut(active_tab) {
@@ -1541,7 +1759,7 @@ impl App {
                 }
             }
         }
-        
+
         let visible = self
             .tabs
             .get(active_tab)
@@ -1554,18 +1772,19 @@ impl App {
             self.terminal_focus = TerminalFocus::None;
         }
     }
-    
+
     #[allow(dead_code)]
     pub fn is_local_terminal_visible(&self) -> bool {
         self.local_terminal_visible
     }
-    
+
     pub fn is_remote_terminal_visible(&self) -> bool {
-        self.tabs.get(self.active_tab)
+        self.tabs
+            .get(self.active_tab)
             .map(|t| t.remote_terminal_visible)
             .unwrap_or(false)
     }
-    
+
     pub fn poll_remote_terminals(&mut self) {
         for tab in &mut self.tabs {
             if let Some(term) = &mut tab.remote_terminal {
@@ -1573,7 +1792,7 @@ impl App {
             }
         }
     }
-    
+
     pub fn refresh_connections(&mut self) {
         if let Ok(all) = self.db.get_all_connections() {
             self.all_connections = all;
@@ -1582,7 +1801,7 @@ impl App {
             self.recent_connections = recent;
         }
     }
-    
+
     pub fn close_dialog(&mut self) {
         self.mode = if !self.tabs.is_empty() {
             AppMode::Connected
@@ -1591,30 +1810,34 @@ impl App {
         };
         self.connection_dialog.error_message = None;
     }
-    
+
     pub fn dialog_next_field(&mut self) {
         self.connection_dialog.active_field = self.connection_dialog.active_field.next();
     }
-    
+
     pub fn dialog_prev_field(&mut self) {
         self.connection_dialog.active_field = self.connection_dialog.active_field.prev();
     }
-    
+
     pub fn dialog_input(&mut self, c: char) {
-        let field = self.connection_dialog.get_field_value_mut(self.connection_dialog.active_field);
+        let field = self
+            .connection_dialog
+            .get_field_value_mut(self.connection_dialog.active_field);
         field.push(c);
     }
-    
+
     pub fn dialog_backspace(&mut self) {
-        let field = self.connection_dialog.get_field_value_mut(self.connection_dialog.active_field);
+        let field = self
+            .connection_dialog
+            .get_field_value_mut(self.connection_dialog.active_field);
         field.pop();
     }
-    
+
     pub fn try_connect(&mut self) -> Result<()> {
         let params = self.connection_dialog.to_connection_params()?;
-        
+
         let conn = SshConnection::connect(&params)?;
-        
+
         let auth_method = if params.password.is_some() {
             AuthMethod::Password
         } else if let Some(ref path) = params.key_path {
@@ -1622,13 +1845,13 @@ impl App {
         } else {
             AuthMethod::DefaultKey
         };
-        
+
         let name = if self.connection_dialog.name.is_empty() {
             format!("{}@{}", params.username, params.host)
         } else {
             self.connection_dialog.name.clone()
         };
-        
+
         let saved = SavedConnection::new(
             name.clone(),
             params.host.clone(),
@@ -1636,13 +1859,13 @@ impl App {
             params.username.clone(),
             auth_method,
         );
-        
+
         let _ = self.db.save_connection(&saved);
         let _ = self.db.update_last_used(&saved.id);
-        
+
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
-        
+
         let session_info = SftpSessionInfo {
             host: params.host.clone(),
             port: params.port,
@@ -1650,10 +1873,16 @@ impl App {
             password: params.password.clone(),
             key_path: params.key_path.clone(),
         };
-        
-        let mut tab = ConnectionTab::new(tab_id, name.clone(), conn, session_info);
+
+        let mut tab = ConnectionTab::new(
+            tab_id,
+            name.clone(),
+            conn,
+            session_info,
+            self.preferences.explorer_sort,
+        );
         tab.refresh_directory_reset_index()?;
-        
+
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         self.mode = AppMode::Connected;
@@ -1661,10 +1890,10 @@ impl App {
         self.refresh_connections();
         self.status_message = Some(format!("Connected to {}", params.host));
         self.error_message = None;
-        
+
         Ok(())
     }
-    
+
     pub fn connect_to_saved(&mut self, saved: &SavedConnection) -> Result<()> {
         let params = ConnectionParams {
             host: saved.host.clone(),
@@ -1676,14 +1905,14 @@ impl App {
                 _ => None,
             },
         };
-        
+
         let conn = SshConnection::connect(&params)?;
-        
+
         let _ = self.db.update_last_used(&saved.id);
-        
+
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
-        
+
         let session_info = SftpSessionInfo {
             host: params.host.clone(),
             port: params.port,
@@ -1691,10 +1920,16 @@ impl App {
             password: params.password.clone(),
             key_path: params.key_path.clone(),
         };
-        
-        let mut tab = ConnectionTab::new(tab_id, saved.name.clone(), conn, session_info);
+
+        let mut tab = ConnectionTab::new(
+            tab_id,
+            saved.name.clone(),
+            conn,
+            session_info,
+            self.preferences.explorer_sort,
+        );
         tab.refresh_directory_reset_index()?;
-        
+
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         self.mode = AppMode::Connected;
@@ -1702,19 +1937,19 @@ impl App {
         self.refresh_connections();
         self.status_message = Some(format!("Connected to {}", params.host));
         self.error_message = None;
-        
+
         Ok(())
     }
-    
+
     #[allow(dead_code)]
     pub fn disconnect_current(&mut self) {
         if self.tabs.is_empty() {
             return;
         }
-        
+
         let tab = self.tabs.remove(self.active_tab);
         tab.connection.disconnect();
-        
+
         if self.tabs.is_empty() {
             self.active_tab = 0;
             self.mode = AppMode::Normal;
@@ -1728,22 +1963,22 @@ impl App {
             }
         }
     }
-    
+
     pub fn current_tab(&self) -> Option<&ConnectionTab> {
         self.tabs.get(self.active_tab)
     }
-    
+
     pub fn current_tab_mut(&mut self) -> Option<&mut ConnectionTab> {
         self.tabs.get_mut(self.active_tab)
     }
-    
+
     #[allow(dead_code)]
     pub fn next_connection_tab(&mut self) {
         if !self.tabs.is_empty() {
             self.active_tab = (self.active_tab + 1) % self.tabs.len();
         }
     }
-    
+
     #[allow(dead_code)]
     pub fn prev_connection_tab(&mut self) {
         if !self.tabs.is_empty() {
@@ -1754,7 +1989,7 @@ impl App {
             };
         }
     }
-    
+
     /// Tab order: menu bar → local → remote → [connection tabs when 2+ sessions] → menu bar.
     pub fn cycle_main_focus_forward(&mut self) {
         match self.mode {
@@ -1762,29 +1997,25 @@ impl App {
                 self.close_menu();
                 self.focus = FocusPanel::Local;
             }
-            AppMode::Normal => {
-                match self.focus {
-                    FocusPanel::Local => self.focus = FocusPanel::Remote,
-                    FocusPanel::Remote => self.open_file_menu(),
-                    FocusPanel::ConnectionTabs => self.focus = FocusPanel::Local,
-                }
-            }
-            AppMode::Connected => {
-                match self.focus {
-                    FocusPanel::Local => self.focus = FocusPanel::Remote,
-                    FocusPanel::Remote => {
-                        if self.tabs.len() > 1 {
-                            self.focus = FocusPanel::ConnectionTabs;
-                            self.tab_bar_highlight = self.active_tab.min(self.tabs.len() - 1);
-                        } else {
-                            self.open_file_menu();
-                        }
-                    }
-                    FocusPanel::ConnectionTabs => {
+            AppMode::Normal => match self.focus {
+                FocusPanel::Local => self.focus = FocusPanel::Remote,
+                FocusPanel::Remote => self.open_file_menu(),
+                FocusPanel::ConnectionTabs => self.focus = FocusPanel::Local,
+            },
+            AppMode::Connected => match self.focus {
+                FocusPanel::Local => self.focus = FocusPanel::Remote,
+                FocusPanel::Remote => {
+                    if self.tabs.len() > 1 {
+                        self.focus = FocusPanel::ConnectionTabs;
+                        self.tab_bar_highlight = self.active_tab.min(self.tabs.len() - 1);
+                    } else {
                         self.open_file_menu();
                     }
                 }
-            }
+                FocusPanel::ConnectionTabs => {
+                    self.open_file_menu();
+                }
+            },
             _ => {}
         }
     }
@@ -1801,20 +2032,16 @@ impl App {
                     self.focus = FocusPanel::Remote;
                 }
             }
-            AppMode::Normal => {
-                match self.focus {
-                    FocusPanel::Local => self.open_file_menu(),
-                    FocusPanel::Remote => self.focus = FocusPanel::Local,
-                    FocusPanel::ConnectionTabs => self.focus = FocusPanel::Local,
-                }
-            }
-            AppMode::Connected => {
-                match self.focus {
-                    FocusPanel::Local => self.open_file_menu(),
-                    FocusPanel::Remote => self.focus = FocusPanel::Local,
-                    FocusPanel::ConnectionTabs => self.focus = FocusPanel::Remote,
-                }
-            }
+            AppMode::Normal => match self.focus {
+                FocusPanel::Local => self.open_file_menu(),
+                FocusPanel::Remote => self.focus = FocusPanel::Local,
+                FocusPanel::ConnectionTabs => self.focus = FocusPanel::Local,
+            },
+            AppMode::Connected => match self.focus {
+                FocusPanel::Local => self.open_file_menu(),
+                FocusPanel::Remote => self.focus = FocusPanel::Local,
+                FocusPanel::ConnectionTabs => self.focus = FocusPanel::Remote,
+            },
             _ => {}
         }
     }
@@ -1846,7 +2073,7 @@ impl App {
         self.active_tab = self.tab_bar_highlight;
         self.focus = FocusPanel::Local;
     }
-    
+
     pub fn get_current_connections(&self) -> &[SavedConnection] {
         if self.showing_recent {
             &self.recent_connections
@@ -1854,7 +2081,7 @@ impl App {
             &self.all_connections
         }
     }
-    
+
     pub fn connection_list_up(&mut self) {
         let len = self.get_current_connections().len();
         if len > 0 {
@@ -1865,28 +2092,28 @@ impl App {
             };
         }
     }
-    
+
     pub fn connection_list_down(&mut self) {
         let len = self.get_current_connections().len();
         if len > 0 {
             self.connection_list_index = (self.connection_list_index + 1) % len;
         }
     }
-    
+
     pub fn select_connection(&mut self) -> Result<()> {
         let connections = if self.showing_recent {
             &self.recent_connections
         } else {
             &self.all_connections
         };
-        
+
         if let Some(saved) = connections.get(self.connection_list_index).cloned() {
             self.connect_to_saved(&saved)?;
         }
-        
+
         Ok(())
     }
-    
+
     pub fn handle_slash_press(&mut self) {
         let now = std::time::Instant::now();
         let is_double_tap = if let Some(last) = self.last_slash_press {
@@ -1894,9 +2121,9 @@ impl App {
         } else {
             false
         };
-        
+
         self.last_slash_press = Some(now);
-        
+
         if self.mode == AppMode::DirectoryInput && is_double_tap {
             self.directory_input = "/".to_string();
             self.directory_completions.clear();
@@ -1909,10 +2136,12 @@ impl App {
             self.open_directory_input();
         }
     }
-    
+
     pub fn open_directory_input(&mut self) {
         let current_dir = match self.focus {
-            FocusPanel::Local | FocusPanel::ConnectionTabs => self.local.browser.current_dir.clone(),
+            FocusPanel::Local | FocusPanel::ConnectionTabs => {
+                self.local.browser.current_dir.clone()
+            }
             FocusPanel::Remote => {
                 if let Some(tab) = self.current_tab() {
                     tab.browser.current_dir.clone()
@@ -1930,7 +2159,7 @@ impl App {
         self.directory_completion_index = 0;
         self.mode = AppMode::DirectoryInput;
     }
-    
+
     pub fn close_directory_input(&mut self) {
         self.directory_input.clear();
         self.directory_completions.clear();
@@ -2091,24 +2320,24 @@ impl App {
             }
         }
     }
-    
+
     pub fn directory_input_add_char(&mut self, c: char) {
         self.directory_input.push(c);
         self.directory_completions.clear();
         self.directory_completion_index = 0;
     }
-    
+
     pub fn directory_input_remove_char(&mut self) {
         self.directory_input.pop();
         self.directory_completions.clear();
         self.directory_completion_index = 0;
     }
-    
+
     pub fn directory_input_tab_complete(&mut self) {
         if self.directory_completions.is_empty() {
             self.directory_completions = self.get_directory_completions();
             self.directory_completion_index = 0;
-            
+
             if self.directory_completions.len() == 1 {
                 self.directory_input = self.directory_completions[0].clone();
                 if !self.directory_input.ends_with('/') {
@@ -2119,14 +2348,16 @@ impl App {
                 self.directory_input = self.directory_completions[0].clone();
             }
         } else {
-            self.directory_completion_index = (self.directory_completion_index + 1) % self.directory_completions.len();
-            self.directory_input = self.directory_completions[self.directory_completion_index].clone();
+            self.directory_completion_index =
+                (self.directory_completion_index + 1) % self.directory_completions.len();
+            self.directory_input =
+                self.directory_completions[self.directory_completion_index].clone();
         }
     }
-    
+
     fn get_directory_completions(&self) -> Vec<String> {
         let input = &self.directory_input;
-        
+
         let (dir_path, partial) = if let Some(pos) = input.rfind('/') {
             let dir = &input[..=pos];
             let partial = &input[pos + 1..];
@@ -2144,9 +2375,9 @@ impl App {
             };
             (format!("{}/", current), input.clone())
         };
-        
+
         let partial_lower = partial.to_lowercase();
-        
+
         match self.focus {
             FocusPanel::Local | FocusPanel::ConnectionTabs => {
                 let expanded_dir = if dir_path.starts_with('~') {
@@ -2158,7 +2389,7 @@ impl App {
                 } else {
                     dir_path.clone()
                 };
-                
+
                 if let Ok(entries) = std::fs::read_dir(&expanded_dir) {
                     entries
                         .filter_map(|e| e.ok())
@@ -2174,7 +2405,8 @@ impl App {
                             } else if partial.starts_with('.') {
                                 name.to_lowercase().starts_with(&partial_lower)
                             } else {
-                                !name.starts_with('.') && name.to_lowercase().starts_with(&partial_lower)
+                                !name.starts_with('.')
+                                    && name.to_lowercase().starts_with(&partial_lower)
                             }
                         })
                         .map(|e| {
@@ -2188,8 +2420,12 @@ impl App {
             }
             FocusPanel::Remote => {
                 if let Some(tab) = self.current_tab() {
-                    let check_dir = if dir_path.is_empty() { "/" } else { dir_path.trim_end_matches('/') };
-                    
+                    let check_dir = if dir_path.is_empty() {
+                        "/"
+                    } else {
+                        dir_path.trim_end_matches('/')
+                    };
+
                     let cmd = format!("ls -1pa {} 2>/dev/null | grep '/$'", check_dir);
                     if let Ok(output) = tab.connection.exec(&cmd) {
                         output
@@ -2213,7 +2449,9 @@ impl App {
                                     }
                                 } else {
                                     // Normal completion - skip hidden files
-                                    if !name.starts_with('.') && name.to_lowercase().starts_with(&partial_lower) {
+                                    if !name.starts_with('.')
+                                        && name.to_lowercase().starts_with(&partial_lower)
+                                    {
                                         Some(format!("{}{}", dir_path, name))
                                     } else {
                                         None
@@ -2230,18 +2468,18 @@ impl App {
             }
         }
     }
-    
+
     pub fn navigate_to_directory(&mut self) {
         let path = self.directory_input.trim().to_string();
         if path.is_empty() {
             self.close_directory_input();
             return;
         }
-        
+
         info!("Navigating to directory: {}", path);
         self.error_message = None;
         self.status_message = None;
-        
+
         let result = match self.focus {
             FocusPanel::Local | FocusPanel::ConnectionTabs => {
                 let res = LocalBrowser::change_directory(&mut self.local.browser, &path);
@@ -2258,73 +2496,84 @@ impl App {
                 }
             }
         };
-        
+
         if let Err(e) = result {
             self.error_message = Some(format!("Cannot navigate: {}", e));
         }
-        
+
         self.close_directory_input();
     }
-    
+
     pub fn check_transfers_and_refresh(&mut self) {
         let items = self.transfer_manager.get_items();
         let mut should_refresh_local = false;
         let mut should_refresh_remote = false;
         let mut had_completed = false;
-        
+
         for item in items.iter() {
             if matches!(item.status, TransferStatus::Completed) {
                 had_completed = true;
-                let local_path = if item.is_download { &item.dest_path } else { &item.source_path };
-                
+                let local_path = if item.is_download {
+                    &item.dest_path
+                } else {
+                    &item.source_path
+                };
+
                 if local_path.starts_with(&self.local.browser.current_dir) {
                     should_refresh_local = true;
                 }
-                
+
                 if let Some(tab) = self.current_tab() {
-                    let remote_path = if item.is_download { &item.source_path } else { &item.dest_path };
+                    let remote_path = if item.is_download {
+                        &item.source_path
+                    } else {
+                        &item.dest_path
+                    };
                     if remote_path.starts_with(&tab.browser.current_dir) {
                         should_refresh_remote = true;
                     }
                 }
             }
         }
-        
+
         if should_refresh_local {
             let _ = LocalBrowser::refresh_files(&mut self.local.browser);
         }
-        
+
         if should_refresh_remote {
             if let Some(tab) = self.current_tab_mut() {
                 let _ = tab.refresh_directory();
             }
         }
-        
+
         if had_completed {
             self.status_message = None;
         }
-        
+
         self.transfer_manager.clear_completed();
     }
-    
+
     pub fn update_local_watcher(&mut self) {
         let dir = PathBuf::from(&self.local.browser.current_dir);
         if let Err(e) = self.editor_manager.watch_local_directory(&dir) {
             debug!("Failed to watch local directory: {}", e);
         }
     }
-    
+
     pub fn check_local_directory_changes(&mut self) {
         if self.editor_manager.check_local_changed() {
             info!("Local directory changed, refreshing file list");
             let _ = LocalBrowser::refresh_files(&mut self.local.browser);
         }
     }
-    
+
     pub fn process_editor_uploads(&mut self) {
         let pending = self.editor_manager.take_pending_uploads();
         for upload in pending {
-            info!("Queueing editor sync upload: {:?} -> {}", upload.local_path, upload.remote_path);
+            info!(
+                "Queueing editor sync upload: {:?} -> {}",
+                upload.local_path, upload.remote_path
+            );
             self.transfer_manager.queue_upload_to_path(
                 upload.session_info,
                 upload.local_path.to_string_lossy().to_string(),
@@ -2333,30 +2582,39 @@ impl App {
             );
         }
     }
-    
+
     pub fn download_selected(&mut self) {
         if self.focus != FocusPanel::Remote {
             return;
         }
-        
+
         let (files, session_info, remote_dir) = {
             if let Some(tab) = self.current_tab() {
-                let files: Vec<_> = tab.browser.get_selected_files()
+                let files: Vec<_> = tab
+                    .browser
+                    .get_selected_files()
                     .iter()
                     .filter(|f| f.name != "..")
                     .map(|f| (f.name.clone(), f.is_dir))
                     .collect();
-                (files, tab.session_info.clone(), tab.browser.current_dir.clone())
+                (
+                    files,
+                    tab.session_info.clone(),
+                    tab.browser.current_dir.clone(),
+                )
             } else {
                 return;
             }
         };
-        
+
         let local_dir = self.local.browser.current_dir.clone();
-        
+
         let count = files.len();
-        info!("Queuing {} file(s) for download from {} to {}", count, remote_dir, local_dir);
-        
+        info!(
+            "Queuing {} file(s) for download from {} to {}",
+            count, remote_dir, local_dir
+        );
+
         for (name, is_dir) in files {
             let remote_path = format!("{}/{}", remote_dir.trim_end_matches('/'), name);
             info!("  Download: {} (is_dir: {})", remote_path, is_dir);
@@ -2367,32 +2625,35 @@ impl App {
                 is_dir,
             );
         }
-        
+
         self.status_message = Some(format!("Queued {} item(s) for download", count));
         self.error_message = None;
-        
+
         if let Some(tab) = self.current_tab_mut() {
             tab.browser.clear_selection();
         }
     }
-    
+
     pub fn upload_selected(&mut self) {
         if self.focus != FocusPanel::Local {
             return;
         }
-        
+
         if self.tabs.is_empty() {
             return;
         }
-        
-        let files: Vec<_> = self.local.browser.get_selected_files()
+
+        let files: Vec<_> = self
+            .local
+            .browser
+            .get_selected_files()
             .iter()
             .filter(|f| f.name != "..")
             .map(|f| (f.name.clone(), f.is_dir))
             .collect();
-        
+
         let local_dir = self.local.browser.current_dir.clone();
-        
+
         let (session_info, remote_dir) = {
             if let Some(tab) = self.current_tab() {
                 (tab.session_info.clone(), tab.browser.current_dir.clone())
@@ -2400,10 +2661,13 @@ impl App {
                 return;
             }
         };
-        
+
         let count = files.len();
-        info!("Queuing {} file(s) for upload from {} to {}", count, local_dir, remote_dir);
-        
+        info!(
+            "Queuing {} file(s) for upload from {} to {}",
+            count, local_dir, remote_dir
+        );
+
         for (name, is_dir) in files {
             let local_path = format!("{}/{}", local_dir.trim_end_matches('/'), name);
             info!("  Upload: {} (is_dir: {})", local_path, is_dir);
@@ -2414,12 +2678,12 @@ impl App {
                 is_dir,
             );
         }
-        
+
         self.status_message = Some(format!("Queued {} item(s) for upload", count));
         self.error_message = None;
         self.local.browser.clear_selection();
     }
-    
+
     pub fn handle_zip_press(&mut self) {
         let now = Instant::now();
         if let Some(first) = self.zip_awaiting_second_press {
@@ -2432,7 +2696,7 @@ impl App {
         }
         self.zip_awaiting_second_press = Some(now);
     }
-    
+
     pub fn zip_selected(&mut self) {
         match self.focus {
             FocusPanel::Local => self.zip_local_files(),
@@ -2443,45 +2707,60 @@ impl App {
             }
         }
     }
-    
+
     fn zip_local_files(&mut self) {
         let base = PathBuf::from(&self.local.browser.current_dir);
-        let files: Vec<PathBuf> = self.local.browser.get_selected_files()
+        let files: Vec<PathBuf> = self
+            .local
+            .browser
+            .get_selected_files()
             .iter()
             .filter(|f| f.name != "..")
             .map(|f| base.join(&f.name))
             .collect();
-        
+
         if files.is_empty() {
             self.zip_awaiting_second_press = None;
             self.pending_zip_transfer = false;
             return;
         }
-        
+
         let zip_name = if files.len() == 1 {
-            format!("{}.zip", files[0].file_name().unwrap_or_default().to_string_lossy())
+            format!(
+                "{}.zip",
+                files[0].file_name().unwrap_or_default().to_string_lossy()
+            )
         } else {
-            format!("archive_{}.zip", chrono::Local::now().format("%Y%m%d_%H%M%S"))
+            format!(
+                "archive_{}.zip",
+                chrono::Local::now().format("%Y%m%d_%H%M%S")
+            )
         };
-        
+
         let zip_path = base.join(&zip_name);
         info!("Creating local zip: {:?} from {:?}", zip_path, files);
-        
+
         self.local.browser.clear_selection();
-        
+
         let should_upload = self.pending_zip_transfer && !self.tabs.is_empty();
         self.pending_zip_transfer = false;
-        
+
         match create_zip(files.clone(), &base, &zip_path) {
             Ok(()) => {
                 info!("Local zip created successfully: {}", zip_name);
                 let _ = LocalBrowser::refresh_files(&mut self.local.browser);
-                
-                if let Some(idx) = self.local.browser.files.iter().position(|f| f.name == zip_name) {
+
+                if let Some(idx) = self
+                    .local
+                    .browser
+                    .files
+                    .iter()
+                    .position(|f| f.name == zip_name)
+                {
                     self.local.browser.selected_index = idx;
                     self.local.browser.selected_indices.insert(idx);
                 }
-                
+
                 if should_upload {
                     let dest = self
                         .tabs
@@ -2489,10 +2768,8 @@ impl App {
                         .map(|t| format!("{}@{}", t.session_info.username, t.session_info.host))
                         .unwrap_or_else(|| "remote".to_string());
                     self.upload_selected();
-                    self.status_message = Some(format!(
-                        "Zipped {} → upload queued to {}",
-                        zip_name, dest
-                    ));
+                    self.status_message =
+                        Some(format!("Zipped {} → upload queued to {}", zip_name, dest));
                 } else {
                     self.status_message = Some(format!("Created {}", zip_name));
                 }
@@ -2504,10 +2781,12 @@ impl App {
             }
         }
     }
-    
+
     fn zip_remote_files(&mut self) {
         let (files, current_dir) = if let Some(tab) = self.current_tab() {
-            let files: Vec<String> = tab.browser.get_selected_files()
+            let files: Vec<String> = tab
+                .browser
+                .get_selected_files()
                 .iter()
                 .filter(|f| f.name != "..")
                 .map(|f| f.name.clone())
@@ -2518,50 +2797,57 @@ impl App {
             self.pending_zip_transfer = false;
             return;
         };
-        
+
         if files.is_empty() {
             self.zip_awaiting_second_press = None;
             self.pending_zip_transfer = false;
             return;
         }
-        
+
         let zip_name = if files.len() == 1 {
             format!("{}.zip", files[0])
         } else {
-            format!("archive_{}.zip", chrono::Local::now().format("%Y%m%d_%H%M%S"))
+            format!(
+                "archive_{}.zip",
+                chrono::Local::now().format("%Y%m%d_%H%M%S")
+            )
         };
-        
-        let files_arg = files.iter()
+
+        let files_arg = files
+            .iter()
             .map(|f| format!("\"{}\"", f))
             .collect::<Vec<_>>()
             .join(" ");
-        
-        let cmd = format!("cd \"{}\" && zip -r \"{}\" {} 2>&1", current_dir, zip_name, files_arg);
+
+        let cmd = format!(
+            "cd \"{}\" && zip -r \"{}\" {} 2>&1",
+            current_dir, zip_name, files_arg
+        );
         info!("Creating remote zip with command: {}", cmd);
-        
+
         let should_download = self.pending_zip_transfer;
         self.pending_zip_transfer = false;
-        
+
         let result = if let Some(tab) = self.current_tab_mut() {
             tab.browser.clear_selection();
             tab.connection.exec(&cmd)
         } else {
             return;
         };
-        
+
         let mut success = false;
-        
+
         match result {
             Ok(output) => {
                 info!("Remote zip output: {}", output);
-                
+
                 let lower = output.to_lowercase();
-                let is_error = lower.contains("command not found") || 
-                               lower.contains("zip: not found") ||
-                               lower.contains("no such file") ||
-                               lower.contains("permission denied") ||
-                               (lower.contains("zip error") || lower.contains("zip: error"));
-                
+                let is_error = lower.contains("command not found")
+                    || lower.contains("zip: not found")
+                    || lower.contains("no such file")
+                    || lower.contains("permission denied")
+                    || (lower.contains("zip error") || lower.contains("zip: error"));
+
                 if is_error {
                     warn!("Remote zip failed: {}", output);
                     self.error_message = Some(output.trim().to_string());
@@ -2576,10 +2862,10 @@ impl App {
                 self.error_message = Some(format!("Zip failed: {}", e));
             }
         }
-        
+
         if let Some(tab) = self.current_tab_mut() {
             let _ = tab.refresh_directory();
-            
+
             if success {
                 if let Some(idx) = tab.browser.files.iter().position(|f| f.name == zip_name) {
                     tab.browser.selected_index = idx;
@@ -2587,7 +2873,7 @@ impl App {
                 }
             }
         }
-        
+
         if success && should_download {
             let local_dir = self.local.browser.current_dir.clone();
             self.download_selected();
@@ -2599,7 +2885,7 @@ impl App {
             self.status_message = Some(format!("Created {}", zip_name));
         }
     }
-    
+
     /// Open selected files in the default editor
     pub fn open_selected(&mut self) {
         match self.focus {
@@ -2612,28 +2898,34 @@ impl App {
             FocusPanel::ConnectionTabs => {}
         }
     }
-    
+
     fn open_local_files(&mut self) {
         let all_selected = self.local.browser.get_selected_files();
-        debug!("open_local_files: {} files in selection", all_selected.len());
-        
+        debug!(
+            "open_local_files: {} files in selection",
+            all_selected.len()
+        );
+
         let files: Vec<(String, bool)> = all_selected
             .iter()
             .filter(|f| f.name != ".." && !f.is_dir)
             .map(|f| (f.name.clone(), f.is_dir))
             .collect();
-        
+
         if files.is_empty() {
             debug!("No files to open (all filtered out or empty selection)");
             return;
         }
-        
+
         let current_dir = self.local.browser.current_dir.clone();
         let editor_command = self.preferences.editor_command.clone();
-        
+
         for (name, _is_dir) in files {
             let path = PathBuf::from(&current_dir).join(&name);
-            info!("Opening local file: {:?} with editor: {}", path, editor_command);
+            info!(
+                "Opening local file: {:?} with editor: {}",
+                path, editor_command
+            );
             match self.editor_manager.open_local_file(&path, &editor_command) {
                 Ok(()) => {
                     info!("Opened local file: {:?}", path);
@@ -2646,14 +2938,16 @@ impl App {
                 }
             }
         }
-        
+
         self.error_message = None;
     }
-    
+
     fn open_remote_files(&mut self) {
         // Get selected files and connection info
         let (files, current_dir, session_info) = if let Some(tab) = self.current_tab() {
-            let files: Vec<String> = tab.browser.get_selected_files()
+            let files: Vec<String> = tab
+                .browser
+                .get_selected_files()
                 .iter()
                 .filter(|f| f.name != ".." && !f.is_dir)
                 .map(|f| f.name.clone())
@@ -2663,30 +2957,38 @@ impl App {
         } else {
             return;
         };
-        
+
         if files.is_empty() {
             return;
         }
-        
+
         // Get SFTP from connection
-        let sftp = match self.current_tab().and_then(|tab| tab.connection.sftp().ok()) {
+        let sftp = match self
+            .current_tab()
+            .and_then(|tab| tab.connection.sftp().ok())
+        {
             Some(sftp) => sftp,
             None => {
                 self.error_message = Some("Failed to create SFTP session".to_string());
                 return;
             }
         };
-        
+
         let editor_command = self.preferences.editor_command.clone();
-        
+
         for name in files {
             let remote_path = if current_dir.ends_with('/') {
                 format!("{}{}", current_dir, name)
             } else {
                 format!("{}/{}", current_dir, name)
             };
-            
-            match self.editor_manager.open_remote_file(&session_info, &remote_path, &sftp, &editor_command) {
+
+            match self.editor_manager.open_remote_file(
+                &session_info,
+                &remote_path,
+                &sftp,
+                &editor_command,
+            ) {
                 Ok(()) => {
                     info!("Opened remote file: {}", remote_path);
                     self.status_message = Some(format!("Opened {}", name));
@@ -2698,10 +3000,10 @@ impl App {
                 }
             }
         }
-        
+
         self.error_message = None;
     }
-    
+
     pub fn enter_selected(&mut self) -> Result<()> {
         match self.focus {
             FocusPanel::Local => {
@@ -2739,7 +3041,7 @@ impl App {
         self.status_message = None;
         Ok(())
     }
-    
+
     pub fn show_delete_confirm(&mut self) {
         let targets: Vec<(String, bool)> = match self.focus {
             FocusPanel::ConnectionTabs => return,
@@ -2773,7 +3075,7 @@ impl App {
         self.delete_confirm_yes = true;
         self.mode = AppMode::DeleteConfirm;
     }
-    
+
     pub fn cancel_delete(&mut self) {
         self.mode = if !self.tabs.is_empty() {
             AppMode::Connected
@@ -2782,11 +3084,11 @@ impl App {
         };
         self.delete_targets.clear();
     }
-    
+
     pub fn toggle_delete_option(&mut self) {
         self.delete_confirm_yes = !self.delete_confirm_yes;
     }
-    
+
     pub fn confirm_delete(&mut self) {
         if !self.delete_confirm_yes {
             self.cancel_delete();
@@ -2824,18 +3126,18 @@ impl App {
                 }
                 FocusPanel::Remote => {
                     if let Some(tab) = self.current_tab_mut() {
-                        let remote_path = format!(
-                            "{}/{}",
-                            tab.browser.current_dir.trim_end_matches('/'),
-                            name
-                        );
+                        let remote_path =
+                            format!("{}/{}", tab.browser.current_dir.trim_end_matches('/'), name);
                         let cmd = if *is_dir {
                             format!("rm -rf \"{}\"", remote_path)
                         } else {
                             format!("rm -f \"{}\"", remote_path)
                         };
                         debug!("Remote delete command: {}", cmd);
-                        tab.connection.exec(&cmd).map(|_| ()).map_err(|e| e.to_string())
+                        tab.connection
+                            .exec(&cmd)
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
                     } else {
                         Ok(())
                     }
@@ -2868,10 +3170,7 @@ impl App {
                 format!("Deleted {} items", targets.len())
             });
         } else if n_ok == 0 {
-            self.error_message = Some(format!(
-                "Delete failed: {}",
-                failures[0].1
-            ));
+            self.error_message = Some(format!("Delete failed: {}", failures[0].1));
             self.status_message = None;
         } else {
             self.error_message = Some(format!(
@@ -2886,5 +3185,4 @@ impl App {
 
         self.cancel_delete();
     }
-    
 }

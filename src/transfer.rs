@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::{info, error, warn};
+use log::{error, info, warn};
 use parking_lot::Mutex;
 use ssh2::{Session, Sftp};
 use std::collections::HashSet;
@@ -17,10 +17,16 @@ const RETRY_DELAY_MS: u64 = 1000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferStatus {
     Pending,
-    InProgress { bytes_transferred: u64, total_bytes: u64 },
+    InProgress {
+        bytes_transferred: u64,
+        total_bytes: u64,
+    },
     Completed,
     Failed(String),
-    Retrying { attempt: u32, reason: String },
+    Retrying {
+        attempt: u32,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -118,7 +124,8 @@ impl TransferManager {
                 thread::sleep(std::time::Duration::from_millis(100));
             }
 
-            let result = Self::execute_download(&items, id, &sftp_session, &remote_path, &dest_path, is_dir);
+            let result =
+                Self::execute_download(&items, id, &sftp_session, &remote_path, &dest_path, is_dir);
 
             if let Err(e) = result {
                 let mut items_guard = items.lock();
@@ -146,10 +153,10 @@ impl TransferManager {
             .unwrap_or_else(|| "upload".to_string());
 
         let dest_path = format!("{}/{}", remote_dir.trim_end_matches('/'), filename);
-        
+
         self.queue_upload_to_path(sftp_session, local_path, dest_path, is_dir)
     }
-    
+
     /// Queue an upload to a specific remote path (used for syncing edited files)
     pub fn queue_upload_to_path(
         &self,
@@ -196,7 +203,8 @@ impl TransferManager {
                 thread::sleep(std::time::Duration::from_millis(100));
             }
 
-            let result = Self::execute_upload(&items, id, &sftp_session, &local_path, &dest_path, is_dir);
+            let result =
+                Self::execute_upload(&items, id, &sftp_session, &local_path, &dest_path, is_dir);
 
             if let Err(e) = result {
                 let mut items_guard = items.lock();
@@ -221,11 +229,14 @@ impl TransferManager {
     ) -> Result<()> {
         let mut attempt = 0;
 
-        info!("Starting download #{}: {} -> {}", id, remote_path, local_path);
+        info!(
+            "Starting download #{}: {} -> {}",
+            id, remote_path, local_path
+        );
 
         loop {
             attempt += 1;
-            
+
             if attempt > 1 {
                 warn!("Download #{} retry attempt {}", id, attempt);
             }
@@ -255,7 +266,9 @@ impl TransferManager {
                     if attempt >= MAX_RETRIES {
                         return Err(e);
                     }
-                    thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS * attempt as u64));
+                    thread::sleep(std::time::Duration::from_millis(
+                        RETRY_DELAY_MS * attempt as u64,
+                    ));
                     continue;
                 }
             };
@@ -292,7 +305,9 @@ impl TransferManager {
                             };
                         }
                     }
-                    thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS * attempt as u64));
+                    thread::sleep(std::time::Duration::from_millis(
+                        RETRY_DELAY_MS * attempt as u64,
+                    ));
                 }
             }
         }
@@ -315,7 +330,9 @@ impl TransferManager {
         ));
 
         // Get file size
-        let stat = sftp.stat(remote_path).context("Failed to stat remote file")?;
+        let stat = sftp
+            .stat(remote_path)
+            .context("Failed to stat remote file")?;
         let total_bytes = stat.size.unwrap_or(0);
 
         // Update total bytes
@@ -339,7 +356,9 @@ impl TransferManager {
         }
 
         // Open remote file
-        let mut remote_file = sftp.open(remote_path).context("Failed to open remote file")?;
+        let mut remote_file = sftp
+            .open(remote_path)
+            .context("Failed to open remote file")?;
 
         // Open/create local temp file
         let mut local_file = if resume_position > 0 {
@@ -465,7 +484,9 @@ impl TransferManager {
                     if attempt >= MAX_RETRIES {
                         return Err(e);
                     }
-                    thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS * attempt as u64));
+                    thread::sleep(std::time::Duration::from_millis(
+                        RETRY_DELAY_MS * attempt as u64,
+                    ));
                     continue;
                 }
             };
@@ -502,7 +523,9 @@ impl TransferManager {
                             };
                         }
                     }
-                    thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS * attempt as u64));
+                    thread::sleep(std::time::Duration::from_millis(
+                        RETRY_DELAY_MS * attempt as u64,
+                    ));
                 }
             }
         }
@@ -521,7 +544,10 @@ impl TransferManager {
         // Create temp remote path
         let temp_remote = remote_path.with_file_name(format!(
             "$.{}.temp",
-            remote_path.file_name().unwrap_or_default().to_string_lossy()
+            remote_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
         ));
 
         // Get local file size
@@ -589,7 +615,7 @@ impl TransferManager {
         // Delete existing file if it exists, then rename temp to final
         // SFTP rename doesn't overwrite on some servers
         let _ = sftp.unlink(remote_path);
-        
+
         sftp.rename(&temp_remote, remote_path, None)
             .context("Failed to rename temp file on remote")?;
 
@@ -641,7 +667,9 @@ impl TransferManager {
 
         // Try password authentication if provided
         if let Some(ref password) = info.password {
-            if session.userauth_password(&info.username, password).is_ok() && session.authenticated() {
+            if session.userauth_password(&info.username, password).is_ok()
+                && session.authenticated()
+            {
                 return Ok(session);
             }
         }
@@ -650,7 +678,10 @@ impl TransferManager {
         if let Some(ref key_path) = info.key_path {
             let key = PathBuf::from(key_path);
             if key.exists() {
-                if session.userauth_pubkey_file(&info.username, None, &key, None).is_ok() {
+                if session
+                    .userauth_pubkey_file(&info.username, None, &key, None)
+                    .is_ok()
+                {
                     return Ok(session);
                 }
             }
@@ -662,7 +693,10 @@ impl TransferManager {
             for key_name in &["id_ed25519", "id_rsa", "id_ecdsa"] {
                 let key_path = ssh_dir.join(key_name);
                 if key_path.exists() {
-                    if session.userauth_pubkey_file(&info.username, None, &key_path, None).is_ok() {
+                    if session
+                        .userauth_pubkey_file(&info.username, None, &key_path, None)
+                        .is_ok()
+                    {
                         return Ok(session);
                     }
                 }
@@ -675,7 +709,10 @@ impl TransferManager {
     pub fn clear_completed(&self) {
         let mut items = self.items.lock();
         items.retain(|item| {
-            !matches!(item.status, TransferStatus::Completed | TransferStatus::Failed(_))
+            !matches!(
+                item.status,
+                TransferStatus::Completed | TransferStatus::Failed(_)
+            )
         });
     }
 }
@@ -689,11 +726,7 @@ pub struct SftpSessionInfo {
     pub key_path: Option<String>,
 }
 
-pub fn create_zip(
-    files: Vec<PathBuf>,
-    base_dir: &Path,
-    output_path: &Path,
-) -> Result<()> {
+pub fn create_zip(files: Vec<PathBuf>, base_dir: &Path, output_path: &Path) -> Result<()> {
     use std::io::BufWriter;
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
