@@ -46,7 +46,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         AppMode::Connected
         | AppMode::DirectoryInput
         | AppMode::RenameInput
-        | AppMode::DeleteConfirm => {
+        | AppMode::DeleteConfirm
+        | AppMode::ExtractConflictConfirm => {
             draw_connected_view(frame, app, chunks[1]);
         }
         AppMode::MenuFocused
@@ -81,6 +82,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     if app.mode == AppMode::DeleteConfirm {
         draw_delete_confirm(frame, app, chunks[1]);
+    }
+
+    if app.mode == AppMode::ExtractConflictConfirm {
+        draw_extract_conflict_confirm(frame, app, chunks[1]);
     }
 
     if app.mode == AppMode::Settings {
@@ -1204,6 +1209,123 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App, main_area: Rect) {
     frame.render_widget(buttons_para, buttons_area);
 }
 
+fn draw_extract_conflict_confirm(frame: &mut Frame, app: &App, main_area: Rect) {
+    let Some(op) = app.pending_extract_operation.as_ref() else {
+        return;
+    };
+
+    let panel_area = if app.tabs.is_empty() {
+        main_area
+    } else {
+        let half_width = main_area.width / 2;
+        match op.target {
+            FocusPanel::Local => Rect::new(main_area.x, main_area.y, half_width, main_area.height),
+            FocusPanel::Remote => Rect::new(
+                main_area.x + half_width,
+                main_area.y,
+                main_area.width - half_width,
+                main_area.height,
+            ),
+            FocusPanel::ConnectionTabs => main_area,
+        }
+    };
+
+    let n = op.conflict_paths.len();
+    let dialog_width = 66u16.min(panel_area.width.saturating_sub(4));
+    let body_lines: u16 = if n <= 1 { 2 } else { 3 };
+    let detail_h: u16 = if n <= 3 { n.max(1) as u16 } else { 4 };
+    let note_h: u16 = 2;
+    let inner_content_h = body_lines + detail_h + note_h + 2;
+    let dialog_height = (2 + inner_content_h)
+        .min(panel_area.height.saturating_sub(2))
+        .max(9);
+
+    let dialog_x = panel_area.x + (panel_area.width.saturating_sub(dialog_width)) / 2;
+    let dialog_y = panel_area.y + (panel_area.height.saturating_sub(dialog_height)) / 2;
+
+    let area = Rect::new(dialog_x, dialog_y, dialog_width, dialog_height);
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Extract Conflict ",
+            Style::default()
+                .fg(MENU_SELECTED)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(MENU_SELECTED))
+        .style(Style::default().bg(PANEL_BG));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let question = if n == 1 {
+        "Extraction would replace 1 existing file.".to_string()
+    } else {
+        format!("Extraction would replace {} existing files.", n)
+    };
+    let question_para = Paragraph::new(Span::styled(question, Style::default().fg(TEXT)))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(
+        question_para,
+        Rect::new(inner.x, inner.y, inner.width, body_lines),
+    );
+
+    let detail_text = if n <= 4 {
+        op.conflict_paths.join("\n")
+    } else {
+        format!("{}\n+ {} more", op.conflict_paths[..3].join("\n"), n - 3)
+    };
+    let detail_para = Paragraph::new(Span::styled(detail_text, Style::default().fg(TEXT_DIM)))
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+    let detail_y = inner.y + body_lines;
+    frame.render_widget(
+        detail_para,
+        Rect::new(inner.x, detail_y, inner.width, detail_h.max(1)),
+    );
+
+    let note = Paragraph::new(Span::styled(
+        "Keep both renames conflicts to name.YYYYMMDDHHMMSS.ext",
+        Style::default().fg(TEXT_DIM),
+    ))
+    .alignment(Alignment::Center)
+    .wrap(Wrap { trim: true });
+    let note_y = detail_y + detail_h + 1;
+    frame.render_widget(note, Rect::new(inner.x, note_y, inner.width, note_h));
+
+    let overwrite_style = if app.extract_conflict_overwrite {
+        Style::default()
+            .fg(Color::Black)
+            .bg(ERROR)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TEXT)
+    };
+
+    let keep_style = if !app.extract_conflict_overwrite {
+        Style::default()
+            .fg(Color::Black)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TEXT)
+    };
+
+    let buttons = Line::from(vec![
+        Span::styled(" [ Overwrite ] ", overwrite_style),
+        Span::raw("   "),
+        Span::styled(" [ Keep Both ] ", keep_style),
+    ]);
+    let buttons_para = Paragraph::new(buttons).alignment(Alignment::Center);
+    frame.render_widget(
+        buttons_para,
+        Rect::new(inner.x, note_y + note_h + 1, inner.width, 1),
+    );
+}
+
 fn draw_settings(frame: &mut Frame, app: &App) {
     let screen = frame.area();
     let dialog_width = (screen.width.saturating_sub(4)).min(78);
@@ -1381,6 +1503,7 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
         ("Ctrl+R", "Refresh file list (focused panel)"),
         ("R", "Rename selected item (single selection only)"),
         ("D", "Download selected (remote panel)"),
+        ("E", "Extract selected .zip files"),
         ("U", "Upload selected (local panel)"),
         ("Z", "Zip selected files/folders"),
         (
@@ -1537,7 +1660,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         match app.mode {
             AppMode::Normal => match app.focus {
-                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex R:Rename Ctrl+R:Refresh Z:Zip X:Del /:Path Tab:Next area `:Term",
+                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex R:Rename Ctrl+R:Refresh E:Extract Z:Zip X:Del /:Path Tab:Next area `:Term",
                 FocusPanel::Remote => "↑↓:Nav Enter:Connect Tab:Next area",
                 FocusPanel::ConnectionTabs => "Tab:Next area",
             },
@@ -1546,13 +1669,16 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             AppMode::ConnectionDialog => "Tab:Next Enter:Connect Esc:Cancel",
             AppMode::ConnectionList => "↑↓:Nav Enter:Connect Esc:Close",
             AppMode::Connected => match app.focus {
-                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex R:Rename Ctrl+R:Refresh U:Upload Z:Zip X:Del /:Path Tab:Next area `:Term",
-                FocusPanel::Remote => "↑↓:Nav Enter:Open ::Filter ;:Regex R:Rename Ctrl+R:Refresh D:Download Z:Zip X:Del /:Path Tab:Next area `:Term",
+                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex R:Rename Ctrl+R:Refresh U:Upload E:Extract Z:Zip X:Del /:Path Tab:Next area `:Term",
+                FocusPanel::Remote => "↑↓:Nav Enter:Open ::Filter ;:Regex R:Rename Ctrl+R:Refresh D:Download E:Extract Z:Zip X:Del /:Path Tab:Next area `:Term",
                 FocusPanel::ConnectionTabs => "←→:Select Enter:Switch session Tab:Next area Esc:Files",
             },
             AppMode::DirectoryInput => "Tab:Complete Enter:Go Esc:Cancel",
             AppMode::RenameInput => "Enter:Apply Esc:Cancel Backspace:Delete char",
             AppMode::DeleteConfirm => "←→:Select Enter:Confirm Esc:Cancel",
+            AppMode::ExtractConflictConfirm => {
+                "←→:Choose Enter:Extract O:Overwrite K:Keep both Esc:Cancel"
+            }
             AppMode::Settings => "↑↓ ←→ Space:Toggle/Cycle Enter:Edit/Cycle Esc:Close",
             AppMode::KeyboardShortcuts => "↑↓ j/k Ctrl+Y/V PgUp/Dn Home/End Esc:Close",
         }

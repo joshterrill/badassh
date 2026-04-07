@@ -2,7 +2,10 @@ use crate::db::{AuthMethod, Database, SavedConnection};
 use crate::editor::{detect_default_editor, EditorManager};
 use crate::ssh::{ConnectionParams, SshConnection};
 use crate::terminal::{LocalTerminal, RemoteTerminal};
-use crate::transfer::{create_zip, SftpSessionInfo, TransferManager, TransferStatus};
+use crate::transfer::{
+    create_zip, extract_zip_archive, list_zip_entries, ExtractConflictStrategy, SftpSessionInfo,
+    TransferManager, TransferStatus,
+};
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -356,8 +359,17 @@ pub enum AppMode {
     DirectoryInput,
     RenameInput,
     DeleteConfirm,
+    ExtractConflictConfirm,
     Settings,
     KeyboardShortcuts,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingExtractOperation {
+    pub target: FocusPanel,
+    pub current_dir: String,
+    pub archives: Vec<String>,
+    pub conflict_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1230,6 +1242,8 @@ pub struct App {
     pub delete_confirm_yes: bool,
     /// Names (and dir flags) to delete when confirming; built from multi-selection or single cursor.
     pub delete_targets: Vec<(String, bool)>,
+    pub extract_conflict_overwrite: bool,
+    pub pending_extract_operation: Option<PendingExtractOperation>,
     pub preferences: UserPreferences,
     pub settings_selected_index: usize,
     pub settings_editing_editor: bool,
@@ -1294,6 +1308,8 @@ impl App {
             pending_zip_transfer: false,
             delete_confirm_yes: true,
             delete_targets: Vec::new(),
+            extract_conflict_overwrite: true,
+            pending_extract_operation: None,
             preferences,
             settings_selected_index: 0,
             settings_editing_editor: false,
@@ -2708,6 +2724,14 @@ impl App {
         }
     }
 
+    pub fn extract_selected(&mut self) {
+        match self.focus {
+            FocusPanel::Local => self.extract_local_archives(),
+            FocusPanel::Remote => self.extract_remote_archives(),
+            FocusPanel::ConnectionTabs => {}
+        }
+    }
+
     fn zip_local_files(&mut self) {
         let base = PathBuf::from(&self.local.browser.current_dir);
         let files: Vec<PathBuf> = self
@@ -2883,6 +2907,313 @@ impl App {
             ));
         } else if success {
             self.status_message = Some(format!("Created {}", zip_name));
+        }
+    }
+
+    fn extract_local_archives(&mut self) {
+        let current_dir = self.local.browser.current_dir.clone();
+        let selected = self.local.browser.get_selected_files();
+        let archives = match Self::extractable_zip_names(selected) {
+            Ok(archives) => archives,
+            Err(message) => {
+                self.error_message = Some(message.to_string());
+                self.status_message = None;
+                return;
+            }
+        };
+
+        if archives.is_empty() {
+            return;
+        }
+
+        match self.local_extract_conflicts(&current_dir, &archives) {
+            Ok(conflicts) if !conflicts.is_empty() => {
+                self.show_extract_conflict_dialog(
+                    FocusPanel::Local,
+                    current_dir,
+                    archives,
+                    conflicts,
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!("Local unzip conflict scan failed: {}", e);
+                self.error_message = Some(format!("Extract failed: {}", e));
+                self.status_message = None;
+                return;
+            }
+        }
+
+        self.perform_local_extract(&current_dir, &archives, ExtractConflictStrategy::Overwrite);
+    }
+
+    fn extract_remote_archives(&mut self) {
+        let (archives, current_dir) = if let Some(tab) = self.current_tab() {
+            let selected = tab.browser.get_selected_files();
+            let archives = match Self::extractable_zip_names(selected) {
+                Ok(archives) => archives,
+                Err(message) => {
+                    self.error_message = Some(message.to_string());
+                    self.status_message = None;
+                    return;
+                }
+            };
+            (archives, tab.browser.current_dir.clone())
+        } else {
+            return;
+        };
+
+        if archives.is_empty() {
+            return;
+        }
+
+        match self.remote_extract_conflicts(&current_dir, &archives) {
+            Ok(conflicts) if !conflicts.is_empty() => {
+                self.show_extract_conflict_dialog(
+                    FocusPanel::Remote,
+                    current_dir,
+                    archives,
+                    conflicts,
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!("Remote unzip conflict scan failed: {}", e);
+                self.error_message = Some(format!("Extract failed: {}", e));
+                self.status_message = None;
+                return;
+            }
+        }
+
+        self.perform_remote_extract(&current_dir, &archives, ExtractConflictStrategy::Overwrite);
+    }
+
+    fn local_extract_conflicts(
+        &self,
+        current_dir: &str,
+        archives: &[String],
+    ) -> Result<Vec<String>> {
+        let base = PathBuf::from(current_dir);
+        let mut conflicts = HashSet::new();
+
+        for archive_name in archives {
+            let archive_path = base.join(archive_name);
+            for relative in list_zip_entries(&archive_path)? {
+                if base.join(&relative).exists() {
+                    conflicts.insert(relative.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        let mut conflicts: Vec<_> = conflicts.into_iter().collect();
+        conflicts.sort();
+        Ok(conflicts)
+    }
+
+    fn remote_extract_conflicts(
+        &mut self,
+        current_dir: &str,
+        archives: &[String],
+    ) -> Result<Vec<String>> {
+        let mut conflicts = HashSet::new();
+
+        for archive_name in archives {
+            let cmd = format!(
+                "status=0; cd {} || status=$?; if [ \"$status\" -eq 0 ]; then entries=$(unzip -Z1 {} 2>&1); status=$?; if [ \"$status\" -eq 0 ]; then printf '%s\\n' \"$entries\" | while IFS= read -r entry; do [ -z \"$entry\" ] && continue; case \"$entry\" in */) continue ;; esac; [ -e \"$entry\" ] && printf '%s\\n' \"$entry\"; done; else printf '%s\\n' \"$entries\"; fi; fi; printf '\\n__BADASSH_STATUS__%s' \"$status\"",
+                Self::shell_quote(current_dir),
+                Self::shell_quote(archive_name),
+            );
+
+            let output = if let Some(tab) = self.current_tab_mut() {
+                tab.connection.exec(&cmd)?
+            } else {
+                anyhow::bail!("No active remote tab");
+            };
+
+            let (message, status) = Self::split_remote_status_marker(&output);
+            if status != Some(0) {
+                anyhow::bail!(if message.is_empty() {
+                    format!("Failed to inspect {}", archive_name)
+                } else {
+                    message
+                });
+            }
+
+            for line in message
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                conflicts.insert(line.to_string());
+            }
+        }
+
+        let mut conflicts: Vec<_> = conflicts.into_iter().collect();
+        conflicts.sort();
+        Ok(conflicts)
+    }
+
+    fn perform_local_extract(
+        &mut self,
+        current_dir: &str,
+        archives: &[String],
+        strategy: ExtractConflictStrategy,
+    ) {
+        let base = PathBuf::from(current_dir);
+
+        for archive_name in archives {
+            let archive_path = base.join(archive_name);
+            if let Err(e) = extract_zip_archive(&archive_path, &base, &strategy) {
+                error!("Local unzip failed for {}: {}", archive_name, e);
+                let _ = LocalBrowser::refresh_files(&mut self.local.browser);
+                self.error_message = Some(format!("Extract failed: {}", e));
+                self.status_message = None;
+                return;
+            }
+        }
+
+        let _ = LocalBrowser::refresh_files(&mut self.local.browser);
+        self.error_message = None;
+        self.status_message = Some(if archives.len() == 1 {
+            format!("Extracted {}", archives[0])
+        } else {
+            format!("Extracted {} zip files", archives.len())
+        });
+    }
+
+    fn perform_remote_extract(
+        &mut self,
+        current_dir: &str,
+        archives: &[String],
+        strategy: ExtractConflictStrategy,
+    ) {
+        let mut success = true;
+
+        for archive_name in archives {
+            let cmd = match &strategy {
+                ExtractConflictStrategy::Overwrite => {
+                    self.build_remote_extract_overwrite_command(current_dir, archive_name)
+                }
+                ExtractConflictStrategy::KeepBoth { timestamp } => self
+                    .build_remote_extract_keep_both_command(current_dir, archive_name, timestamp),
+            };
+            info!("Extracting remote zip with command: {}", cmd);
+
+            let output = if let Some(tab) = self.current_tab_mut() {
+                match tab.connection.exec(&cmd) {
+                    Ok(output) => output,
+                    Err(e) => {
+                        error!("Remote unzip command failed: {}", e);
+                        self.error_message = Some(format!("Extract failed: {}", e));
+                        self.status_message = None;
+                        success = false;
+                        break;
+                    }
+                }
+            } else {
+                self.error_message = Some("No active remote tab".to_string());
+                self.status_message = None;
+                success = false;
+                break;
+            };
+
+            let (message, status) = Self::split_remote_status_marker(&output);
+            if status != Some(0) {
+                let message = if message.is_empty() {
+                    format!("Failed to extract {}", archive_name)
+                } else {
+                    message
+                };
+                warn!("Remote unzip failed: {}", message);
+                self.error_message = Some(message);
+                self.status_message = None;
+                success = false;
+                break;
+            }
+        }
+
+        if let Some(tab) = self.current_tab_mut() {
+            let _ = tab.refresh_directory();
+        }
+
+        if success {
+            self.error_message = None;
+            self.status_message = Some(if archives.len() == 1 {
+                format!("Extracted {}", archives[0])
+            } else {
+                format!("Extracted {} zip files", archives.len())
+            });
+        }
+    }
+
+    fn extractable_zip_names<'a>(
+        selected: impl IntoIterator<Item = &'a FileEntry>,
+    ) -> std::result::Result<Vec<String>, &'static str> {
+        let mut archives = Vec::new();
+
+        for entry in selected {
+            if entry.name == ".." {
+                continue;
+            }
+
+            if entry.is_dir || !Self::is_zip_file_name(&entry.name) {
+                return Err("Can only extract zip files");
+            }
+
+            archives.push(entry.name.clone());
+        }
+
+        Ok(archives)
+    }
+
+    fn is_zip_file_name(name: &str) -> bool {
+        name.to_ascii_lowercase().ends_with(".zip")
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+
+    fn build_remote_extract_overwrite_command(
+        &self,
+        current_dir: &str,
+        archive_name: &str,
+    ) -> String {
+        format!(
+            "status=0; cd {} || status=$?; if [ \"$status\" -eq 0 ]; then output=$(unzip -o {} 2>&1); status=$?; if [ -n \"$output\" ]; then printf '%s' \"$output\"; fi; fi; printf '\\n__BADASSH_STATUS__%s' \"$status\"",
+            Self::shell_quote(current_dir),
+            Self::shell_quote(archive_name),
+        )
+    }
+
+    fn build_remote_extract_keep_both_command(
+        &self,
+        current_dir: &str,
+        archive_name: &str,
+        timestamp: &str,
+    ) -> String {
+        let nl = "'\n'";
+
+        format!(
+            "status=0; cd {dir} || status=$?; tmp=''; if [ \"$status\" -eq 0 ]; then tmp=$(mktemp -d .badassh_extract_XXXXXX 2>&1); status=$?; fi; if [ \"$status\" -eq 0 ]; then output=$(unzip -o {archive} -d \"$tmp\" 2>&1); status=$?; if [ -n \"$output\" ]; then printf '%s\\n' \"$output\"; fi; fi; if [ \"$status\" -eq 0 ]; then OLDIFS=$IFS; IFS={nl}; for dir_path in $(find \"$tmp\" -mindepth 1 -type d 2>/dev/null); do rel=${{dir_path#\"$tmp\"/}}; mkdir -p \"./$rel\" || {{ status=$?; break; }}; done; IFS=$OLDIFS; fi; if [ \"$status\" -eq 0 ]; then OLDIFS=$IFS; IFS={nl}; for src in $(find \"$tmp\" \\( -type f -o -type l \\) 2>/dev/null); do rel=${{src#\"$tmp\"/}}; dest=\"./$rel\"; dest_dir=$(dirname \"$dest\"); mkdir -p \"$dest_dir\" || {{ status=$?; break; }}; if [ -e \"$dest\" ]; then base=${{dest##*/}}; dir_part=${{dest%/*}}; [ \"$dir_part\" = \"$dest\" ] && dir_part='.'; case \"$base\" in *.*) stem=${{base%.*}}; ext=${{base##*.}}; candidate=\"$dir_part/$stem.{timestamp}.$ext\" ;; *) candidate=\"$dir_part/$base.{timestamp}\" ;; esac; n=2; while [ -e \"$candidate\" ]; do case \"$base\" in *.*) candidate=\"$dir_part/$stem.{timestamp}.$n.$ext\" ;; *) candidate=\"$dir_part/$base.{timestamp}.$n\" ;; esac; n=$((n + 1)); done; mv \"$src\" \"$candidate\" || {{ status=$?; break; }}; else mv \"$src\" \"$dest\" || {{ status=$?; break; }}; fi; done; IFS=$OLDIFS; fi; if [ -n \"$tmp\" ] && [ \"$tmp\" != '.' ]; then rm -rf \"$tmp\"; fi; printf '\\n__BADASSH_STATUS__%s' \"$status\"",
+            dir = Self::shell_quote(current_dir),
+            archive = Self::shell_quote(archive_name),
+            timestamp = timestamp,
+            nl = nl,
+        )
+    }
+
+    fn split_remote_status_marker(output: &str) -> (String, Option<i32>) {
+        const MARKER: &str = "__BADASSH_STATUS__";
+
+        if let Some(idx) = output.rfind(MARKER) {
+            let message = output[..idx].trim().to_string();
+            let status = output[idx + MARKER.len()..].trim().parse::<i32>().ok();
+            (message, status)
+        } else {
+            (output.trim().to_string(), None)
         }
     }
 
@@ -3074,6 +3405,69 @@ impl App {
         self.delete_targets = targets;
         self.delete_confirm_yes = true;
         self.mode = AppMode::DeleteConfirm;
+    }
+
+    fn show_extract_conflict_dialog(
+        &mut self,
+        target: FocusPanel,
+        current_dir: String,
+        archives: Vec<String>,
+        conflict_paths: Vec<String>,
+    ) {
+        self.extract_conflict_overwrite = true;
+        self.pending_extract_operation = Some(PendingExtractOperation {
+            target,
+            current_dir,
+            archives,
+            conflict_paths,
+        });
+        self.mode = AppMode::ExtractConflictConfirm;
+    }
+
+    pub fn cancel_extract_conflict(&mut self) {
+        self.pending_extract_operation = None;
+        self.extract_conflict_overwrite = true;
+        self.mode = if !self.tabs.is_empty() {
+            AppMode::Connected
+        } else {
+            AppMode::Normal
+        };
+    }
+
+    pub fn toggle_extract_conflict_option(&mut self) {
+        self.extract_conflict_overwrite = !self.extract_conflict_overwrite;
+    }
+
+    pub fn confirm_extract_conflict(&mut self) {
+        let Some(op) = self.pending_extract_operation.take() else {
+            self.cancel_extract_conflict();
+            return;
+        };
+
+        let strategy = if self.extract_conflict_overwrite {
+            ExtractConflictStrategy::Overwrite
+        } else {
+            ExtractConflictStrategy::KeepBoth {
+                timestamp: chrono::Local::now().format("%Y%m%d%H%M%S").to_string(),
+            }
+        };
+
+        self.extract_conflict_overwrite = true;
+        self.mode = if !self.tabs.is_empty() {
+            AppMode::Connected
+        } else {
+            AppMode::Normal
+        };
+
+        match op.target {
+            FocusPanel::Local => {
+                self.perform_local_extract(&op.current_dir, &op.archives, strategy)
+            }
+            FocusPanel::Remote => {
+                self.perform_remote_extract(&op.current_dir, &op.archives, strategy)
+            }
+            FocusPanel::ConnectionTabs => {}
+        }
     }
 
     pub fn cancel_delete(&mut self) {

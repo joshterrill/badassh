@@ -128,6 +128,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
         AppMode::DirectoryInput => handle_directory_input_keys(app, key),
         AppMode::RenameInput => handle_rename_input_keys(app, key),
         AppMode::DeleteConfirm => handle_delete_confirm_keys(app, key),
+        AppMode::ExtractConflictConfirm => handle_extract_conflict_keys(app, key),
         AppMode::Settings => handle_settings_keys(app, key),
         AppMode::KeyboardShortcuts => handle_keyboard_shortcuts_keys(app, key),
     }
@@ -541,6 +542,23 @@ fn handle_delete_confirm_keys(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_extract_conflict_keys(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_extract_conflict(),
+        KeyCode::Left | KeyCode::Right => app.toggle_extract_conflict_option(),
+        KeyCode::Enter => app.confirm_extract_conflict(),
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            app.extract_conflict_overwrite = true;
+            app.confirm_extract_conflict();
+        }
+        KeyCode::Char('k') | KeyCode::Char('K') => {
+            app.extract_conflict_overwrite = false;
+            app.confirm_extract_conflict();
+        }
+        _ => {}
+    }
+}
+
 fn handle_settings_keys(app: &mut App, key: KeyEvent) {
     if app.settings_editing_editor {
         match key.code {
@@ -680,6 +698,7 @@ fn handle_local_panel_keys(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char(' ') => app.local.browser.toggle_select_current(),
+        KeyCode::Char('e') | KeyCode::Char('E') => app.extract_selected(),
         KeyCode::Char('u') | KeyCode::Char('U') => app.upload_selected(),
         KeyCode::Char('z') | KeyCode::Char('Z') => app.handle_zip_press(),
         KeyCode::Char('x') | KeyCode::Char('X') => app.show_delete_confirm(),
@@ -810,6 +829,7 @@ fn handle_remote_panel_keys(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('d') | KeyCode::Char('D') => app.download_selected(),
+        KeyCode::Char('e') | KeyCode::Char('E') => app.extract_selected(),
         KeyCode::Char('z') | KeyCode::Char('Z') => app.handle_zip_press(),
         KeyCode::Char('x') | KeyCode::Char('X') => app.show_delete_confirm(),
         KeyCode::Char('`') => {
@@ -900,6 +920,7 @@ fn handle_file_browser_keys(app: &mut App, key: KeyEvent) {
             let _ = app.enter_selected();
         }
         KeyCode::Char(' ') => app.local.browser.toggle_select_current(),
+        KeyCode::Char('e') | KeyCode::Char('E') => app.extract_selected(),
         KeyCode::Char('z') | KeyCode::Char('Z') => app.handle_zip_press(),
         KeyCode::Char('x') | KeyCode::Char('X') => app.show_delete_confirm(),
         KeyCode::Char('`') => {

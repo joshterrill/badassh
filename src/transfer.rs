@@ -762,6 +762,154 @@ pub fn create_zip(files: Vec<PathBuf>, base_dir: &Path, output_path: &Path) -> R
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub enum ExtractConflictStrategy {
+    Overwrite,
+    KeepBoth { timestamp: String },
+}
+
+pub fn list_zip_entries(archive_path: &Path) -> Result<Vec<PathBuf>> {
+    use zip::ZipArchive;
+
+    let file = File::open(archive_path)
+        .with_context(|| format!("Failed to open {}", archive_path.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("Failed to read {}", archive_path.display()))?;
+
+    let mut entries = Vec::new();
+
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).with_context(|| {
+            format!(
+                "Failed to read archive entry {} from {}",
+                i,
+                archive_path.display()
+            )
+        })?;
+
+        let Some(relative_path) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+            warn!(
+                "Skipping unsafe zip entry in {}: {}",
+                archive_path.display(),
+                entry.name()
+            );
+            continue;
+        };
+
+        if !entry.is_dir() {
+            entries.push(relative_path);
+        }
+    }
+
+    Ok(entries)
+}
+
+pub fn extract_zip_archive(
+    archive_path: &Path,
+    destination: &Path,
+    strategy: &ExtractConflictStrategy,
+) -> Result<()> {
+    use zip::ZipArchive;
+
+    let file = File::open(archive_path)
+        .with_context(|| format!("Failed to open {}", archive_path.display()))?;
+    let mut archive = ZipArchive::new(file)
+        .with_context(|| format!("Failed to read {}", archive_path.display()))?;
+    let mut reserved_paths: HashSet<PathBuf> = HashSet::new();
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).with_context(|| {
+            format!(
+                "Failed to read archive entry {} from {}",
+                i,
+                archive_path.display()
+            )
+        })?;
+
+        let Some(relative_path) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+            warn!(
+                "Skipping unsafe zip entry in {}: {}",
+                archive_path.display(),
+                entry.name()
+            );
+            continue;
+        };
+
+        let original_output_path = destination.join(relative_path);
+
+        if entry.is_dir() {
+            fs::create_dir_all(&original_output_path)?;
+            reserved_paths.insert(original_output_path);
+            continue;
+        }
+
+        let output_path = match strategy {
+            ExtractConflictStrategy::Overwrite => original_output_path,
+            ExtractConflictStrategy::KeepBoth { timestamp } => {
+                if original_output_path.exists() || reserved_paths.contains(&original_output_path) {
+                    resolve_keep_both_path(&original_output_path, timestamp, &reserved_paths)
+                } else {
+                    original_output_path
+                }
+            }
+        };
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut output = File::create(&output_path)?;
+        std::io::copy(&mut entry, &mut output)?;
+        reserved_paths.insert(output_path.clone());
+
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&output_path, fs::Permissions::from_mode(mode))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_keep_both_path(
+    original_path: &Path,
+    timestamp: &str,
+    reserved_paths: &HashSet<PathBuf>,
+) -> PathBuf {
+    let parent = original_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let file_name = original_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+
+    let mut candidate = parent.join(insert_timestamp_before_extension(&file_name, timestamp));
+    let mut suffix = 2usize;
+
+    while candidate.exists() || reserved_paths.contains(&candidate) {
+        candidate = parent.join(insert_timestamp_before_extension(
+            &file_name,
+            &format!("{}.{}", timestamp, suffix),
+        ));
+        suffix += 1;
+    }
+
+    candidate
+}
+
+fn insert_timestamp_before_extension(file_name: &str, timestamp: &str) -> String {
+    if let Some((stem, ext)) = file_name.rsplit_once('.') {
+        if !stem.is_empty() {
+            return format!("{}.{}.{}", stem, timestamp, ext);
+        }
+    }
+
+    format!("{}.{}", file_name, timestamp)
+}
+
 fn add_parent_dirs<W: Write + Seek>(
     zip: &mut zip::ZipWriter<W>,
     path: &Path,
