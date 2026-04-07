@@ -1251,6 +1251,7 @@ pub struct App {
     pub local_terminal: Option<LocalTerminal>,
     pub local_terminal_visible: bool,
     pub terminal_focus: TerminalFocus,
+    keyboard_shortcuts_return_state: Option<KeyboardShortcutsReturnState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1258,6 +1259,13 @@ pub enum TerminalFocus {
     None,
     LocalTerminal,
     RemoteTerminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyboardShortcutsReturnState {
+    mode: AppMode,
+    focus: FocusPanel,
+    active_menu_tab: MenuTab,
 }
 
 impl App {
@@ -1317,6 +1325,7 @@ impl App {
             local_terminal: None,
             local_terminal_visible: false,
             terminal_focus: TerminalFocus::None,
+            keyboard_shortcuts_return_state: None,
         })
     }
 
@@ -1451,18 +1460,56 @@ impl App {
                 _ => {}
             },
             MenuTab::Help => {
-                self.mode = AppMode::KeyboardShortcuts;
+                self.open_keyboard_shortcuts();
             }
         }
     }
 
+    pub fn can_open_keyboard_shortcuts(&self) -> bool {
+        if self.terminal_focus != TerminalFocus::None {
+            return false;
+        }
+
+        match self.mode {
+            AppMode::Normal => {
+                self.focus == FocusPanel::Local && !self.local.browser.is_filtering()
+            }
+            AppMode::Connected => match self.focus {
+                FocusPanel::Local => !self.local.browser.is_filtering(),
+                FocusPanel::Remote => self
+                    .current_tab()
+                    .map(|tab| !tab.browser.is_filtering())
+                    .unwrap_or(false),
+                FocusPanel::ConnectionTabs => false,
+            },
+            AppMode::MenuFocused => true,
+            _ => false,
+        }
+    }
+
+    pub fn open_keyboard_shortcuts(&mut self) {
+        self.shortcuts_scroll_offset = 0;
+        self.keyboard_shortcuts_return_state = Some(KeyboardShortcutsReturnState {
+            mode: self.mode,
+            focus: self.focus,
+            active_menu_tab: self.active_menu_tab,
+        });
+        self.mode = AppMode::KeyboardShortcuts;
+    }
+
     pub fn close_keyboard_shortcuts(&mut self) {
         self.shortcuts_scroll_offset = 0;
-        self.mode = if !self.tabs.is_empty() {
-            AppMode::Connected
+        if let Some(state) = self.keyboard_shortcuts_return_state.take() {
+            self.mode = state.mode;
+            self.focus = state.focus;
+            self.active_menu_tab = state.active_menu_tab;
         } else {
-            AppMode::Normal
-        };
+            self.mode = if !self.tabs.is_empty() {
+                AppMode::Connected
+            } else {
+                AppMode::Normal
+            };
+        }
     }
 
     pub fn shortcuts_scroll_up(&mut self) {

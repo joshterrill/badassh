@@ -1521,6 +1521,7 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
         ("", "── Menu ──"),
         ("←/→", "Navigate menu tabs"),
         ("Enter/↓", "Open menu dropdown"),
+        ("?", "Open keyboard shortcuts (explorer/menu focus)"),
         ("", ""),
         ("", "── Settings ──"),
         (
@@ -1655,42 +1656,32 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    let hints = if app.terminal_focus != TerminalFocus::None {
-        "Type to input | Ctrl+↑↓:Line scroll | Ctrl+Y/V PgUp/Dn:Page | Esc:Unfocus"
+    let helper = app.can_open_keyboard_shortcuts().then_some("? - Help");
+
+    let status_area = if let Some(helper_text) = helper {
+        let helper_width = helper_text.chars().count() as u16 + 2;
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(helper_width)])
+            .split(area);
+
+        let helper_bar = Paragraph::new(Span::styled(
+            format!(" {} ", helper_text),
+            Style::default().fg(TEXT_DIM),
+        ))
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(MENU_BG));
+        frame.render_widget(helper_bar, chunks[1]);
+        chunks[0]
     } else {
-        match app.mode {
-            AppMode::Normal => match app.focus {
-                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex R:Rename Ctrl+R:Refresh E:Extract Z:Zip X:Del /:Path Tab:Next area `:Term",
-                FocusPanel::Remote => "↑↓:Nav Enter:Connect Tab:Next area",
-                FocusPanel::ConnectionTabs => "Tab:Next area",
-            },
-            AppMode::MenuFocused => "←→:Menu Tab:Next area Enter:Open Esc:Close",
-            AppMode::MenuOpen => "↑↓:Nav Enter:Select Esc:Close",
-            AppMode::ConnectionDialog => "Tab:Next Enter:Connect Esc:Cancel",
-            AppMode::ConnectionList => "↑↓:Nav Enter:Connect Esc:Close",
-            AppMode::Connected => match app.focus {
-                FocusPanel::Local => "↑↓:Nav Enter:Open ::Filter ;:Regex R:Rename Ctrl+R:Refresh U:Upload E:Extract Z:Zip X:Del /:Path Tab:Next area `:Term",
-                FocusPanel::Remote => "↑↓:Nav Enter:Open ::Filter ;:Regex R:Rename Ctrl+R:Refresh D:Download E:Extract Z:Zip X:Del /:Path Tab:Next area `:Term",
-                FocusPanel::ConnectionTabs => "←→:Select Enter:Switch session Tab:Next area Esc:Files",
-            },
-            AppMode::DirectoryInput => "Tab:Complete Enter:Go Esc:Cancel",
-            AppMode::RenameInput => "Enter:Apply Esc:Cancel Backspace:Delete char",
-            AppMode::DeleteConfirm => "←→:Select Enter:Confirm Esc:Cancel",
-            AppMode::ExtractConflictConfirm => {
-                "←→:Choose Enter:Extract O:Overwrite K:Keep both Esc:Cancel"
-            }
-            AppMode::Settings => "↑↓ ←→ Space:Toggle/Cycle Enter:Edit/Cycle Esc:Close",
-            AppMode::KeyboardShortcuts => "↑↓ j/k Ctrl+Y/V PgUp/Dn Home/End Esc:Close",
-        }
+        area
     };
 
     let status_line = Line::from(vec![
         status,
         Span::styled(transfer_status, Style::default().fg(MENU_SELECTED)),
-        Span::styled(" │ ", Style::default().fg(BORDER)),
-        Span::styled(hints, Style::default().fg(TEXT_DIM)),
     ]);
 
     let status_bar = Paragraph::new(status_line).style(Style::default().bg(MENU_BG));
-    frame.render_widget(status_bar, area);
+    frame.render_widget(status_bar, status_area);
 }

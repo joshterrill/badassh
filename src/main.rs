@@ -377,6 +377,7 @@ fn handle_connections_panel_keys(app: &mut App, key: KeyEvent) {
 fn handle_menu_focused_keys(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.close_menu(),
+        KeyCode::Char('?') if app.can_open_keyboard_shortcuts() => app.open_keyboard_shortcuts(),
         KeyCode::Left => app.prev_menu_tab(),
         KeyCode::Right => app.next_menu_tab(),
         KeyCode::Tab => {
@@ -660,6 +661,7 @@ fn handle_local_panel_keys(app: &mut App, key: KeyEvent) {
                 app.open_file_menu();
             }
         }
+        KeyCode::Char('?') if app.can_open_keyboard_shortcuts() => app.open_keyboard_shortcuts(),
         KeyCode::Char(c)
             if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') =>
         {
@@ -770,6 +772,7 @@ fn handle_remote_panel_keys(app: &mut App, key: KeyEvent) {
                 app.open_file_menu();
             }
         }
+        KeyCode::Char('?') if app.can_open_keyboard_shortcuts() => app.open_keyboard_shortcuts(),
         KeyCode::Char(c)
             if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') =>
         {
@@ -883,6 +886,7 @@ fn handle_file_browser_keys(app: &mut App, key: KeyEvent) {
                 app.open_file_menu();
             }
         }
+        KeyCode::Char('?') if app.can_open_keyboard_shortcuts() => app.open_keyboard_shortcuts(),
         KeyCode::Char(c)
             if key.modifiers.contains(KeyModifiers::CONTROL) && (c == 'r' || c == 'R') =>
         {
