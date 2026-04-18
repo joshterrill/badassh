@@ -4,6 +4,7 @@ use ssh2::{Session, Sftp};
 use std::io::Read;
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 pub struct SshConnection {
     session: Session,
@@ -95,6 +96,15 @@ impl SshConnection {
 
     fn try_auto_auth(session: &mut Session, username: &str) -> Result<()> {
         let mut errors = Vec::new();
+        let home =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+        let ssh_dir = home.join(".ssh");
+        let key_names = ["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"];
+        let default_keys: Vec<PathBuf> = key_names
+            .iter()
+            .map(|name| ssh_dir.join(name))
+            .filter(|path| path.exists())
+            .collect();
 
         // Try SSH agent first - this is what usually works in terminal
         // because the agent has your unlocked keys loaded
@@ -107,6 +117,23 @@ impl SshConnection {
                         auth_sock.to_string_lossy(),
                         e
                     ));
+                    #[cfg(target_os = "macos")]
+                    {
+                        match Self::try_load_macos_keychain_identities(&default_keys) {
+                            Ok(true) => match session.userauth_agent(username) {
+                                Ok(()) => return Ok(()),
+                                Err(retry_err) => errors.push(format!(
+                                    "SSH agent after macOS keychain load: {}",
+                                    retry_err
+                                )),
+                            },
+                            Ok(false) => {}
+                            Err(load_err) => errors.push(format!(
+                                "macOS keychain agent load: {}",
+                                load_err
+                            )),
+                        }
+                    }
                 }
             }
         } else {
@@ -114,31 +141,16 @@ impl SshConnection {
         }
 
         // Try default key files
-        let home =
-            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-        let ssh_dir = home.join(".ssh");
-
-        let key_names = ["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"];
-
-        for key_name in &key_names {
-            let key_path = ssh_dir.join(key_name);
-            if key_path.exists() {
-                match session.userauth_pubkey_file(username, None, &key_path, None) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        errors.push(format!("{}: {}", key_path.display(), e));
-                    }
+        for key_path in &default_keys {
+            match session.userauth_pubkey_file(username, None, key_path, None) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    errors.push(format!("{}: {}", key_path.display(), e));
                 }
             }
         }
 
-        // Check if we found any keys at all
-        let keys_found: Vec<_> = key_names
-            .iter()
-            .filter(|k| ssh_dir.join(k).exists())
-            .collect();
-
-        if keys_found.is_empty() {
+        if default_keys.is_empty() {
             errors.push(format!("No SSH keys found in {}", ssh_dir.display()));
         }
 
@@ -148,6 +160,25 @@ impl SshConnection {
             "Authentication failed. Tried methods:\n  - {}\n\nHint: Your keys may require a passphrase. Try running 'ssh-add' first to add your key to the agent.",
             error_details
         )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn try_load_macos_keychain_identities(key_paths: &[PathBuf]) -> Result<bool> {
+        if key_paths.is_empty() {
+            return Ok(false);
+        }
+
+        debug!("Attempting to load SSH identities from macOS keychain");
+        let status = Command::new("/usr/bin/ssh-add")
+            .arg("--apple-load-keychain")
+            .args(key_paths)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("Failed to invoke ssh-add for macOS keychain load")?;
+
+        Ok(status.success())
     }
 
     pub fn exec(&self, command: &str) -> Result<String> {

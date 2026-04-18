@@ -1,6 +1,6 @@
 use crate::app::{
     App, AppMode, DialogField, ExplorerColumns, FileBrowser, FilterMode, FocusPanel, MenuTab,
-    TerminalFocus, SETTINGS_ROW_COUNT, SETTINGS_ROW_EDITOR,
+    PendingDeleteOperation, TerminalFocus, SETTINGS_ROW_COUNT, SETTINGS_ROW_EDITOR,
 };
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -372,16 +372,6 @@ fn draw_connections_panel(frame: &mut Frame, app: &App, area: Rect, is_focused: 
     let list = List::new(items).style(Style::default().bg(PANEL_BG));
 
     frame.render_widget(list, inner);
-
-    if is_focused && inner.height > 2 {
-        let hint = Paragraph::new(Span::styled(
-            "Enter:Connect Tab:Next area",
-            Style::default().fg(TEXT_DIM),
-        ))
-        .alignment(Alignment::Center);
-        let hint_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
-        frame.render_widget(hint, hint_area);
-    }
 }
 
 fn draw_connected_view(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1085,6 +1075,10 @@ fn draw_connection_list(frame: &mut Frame, app: &App) {
 }
 
 fn draw_delete_confirm(frame: &mut Frame, app: &App, main_area: Rect) {
+    let Some(delete_op) = app.pending_delete_operation.as_ref() else {
+        return;
+    };
+
     // Determine which panel to center the dialog in
     let panel_area = if app.tabs.is_empty() {
         main_area
@@ -1102,19 +1096,67 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App, main_area: Rect) {
         }
     };
 
-    let n = app.delete_targets.len();
-    if n == 0 {
-        return;
-    }
+    let (question, detail): (String, Option<String>) = match delete_op {
+        PendingDeleteOperation::Files(targets) => {
+            let n = targets.len();
+            if n == 0 {
+                return;
+            }
 
-    let dialog_width = 52u16.min(panel_area.width.saturating_sub(4));
-    let body_lines: u16 = if n == 1 { 1 } else { 2 };
-    let detail_h: u16 = if n <= 1 {
-        0
-    } else if n <= 6 {
-        1
+            let question = if n == 1 {
+                format!("Are you sure you want to delete \"{}\"?", targets[0].0)
+            } else {
+                format!("Are you sure you want to delete {} selected items?", n)
+            };
+
+            let detail = if n > 1 {
+                Some(if n <= 6 {
+                    targets
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    format!(
+                        "{}, … (+{} more)",
+                        targets[..4]
+                            .iter()
+                            .map(|(name, _)| name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        n - 4
+                    )
+                })
+            } else {
+                None
+            };
+
+            (question, detail)
+        }
+        PendingDeleteOperation::SavedConnection(saved) => (
+            format!(
+                "Are you sure you want to delete {}?",
+                App::format_saved_connection_label(saved)
+            ),
+            None,
+        ),
+    };
+
+    let dialog_width = 60u16.min(panel_area.width.saturating_sub(4));
+    let body_lines: u16 =
+        if question.len() > usize::from(dialog_width.saturating_sub(6)) || detail.is_some() {
+            2
+        } else {
+            1
+        };
+    let detail_h: u16 = if let Some(detail) = detail.as_ref() {
+        if detail.contains("…") {
+            2
+        } else {
+            1
+        }
     } else {
-        2
+        0
     };
     // Inner: question + optional name list + gap + button row
     let inner_content_h = body_lines + detail_h + 1 + 1;
@@ -1140,11 +1182,6 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App, main_area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let question = if n == 1 {
-        format!("Delete \"{}\"?", app.delete_targets[0].0)
-    } else {
-        format!("Delete {} selected items?", n)
-    };
     let question_para = Paragraph::new(Span::styled(question, Style::default().fg(TEXT)))
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true });
@@ -1153,25 +1190,8 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App, main_area: Rect) {
     frame.render_widget(question_para, question_area);
 
     let mut btn_y = inner.y + body_lines;
-    if n > 1 {
-        let names: String = if n <= 6 {
-            app.delete_targets
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        } else {
-            format!(
-                "{}, … (+{} more)",
-                app.delete_targets[..4]
-                    .iter()
-                    .map(|(name, _)| name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                n - 4
-            )
-        };
-        let detail_para = Paragraph::new(Span::styled(names, Style::default().fg(TEXT_DIM)))
+    if let Some(detail) = detail {
+        let detail_para = Paragraph::new(Span::styled(detail, Style::default().fg(TEXT_DIM)))
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true });
         let detail_area = Rect::new(inner.x, btn_y, inner.width, detail_h);
@@ -1201,7 +1221,7 @@ fn draw_delete_confirm(frame: &mut Frame, app: &App, main_area: Rect) {
     let buttons = Line::from(vec![
         Span::styled("  [ Yes ]  ", yes_style),
         Span::raw("    "),
-        Span::styled("  [ No ]  ", no_style),
+        Span::styled(" [ Cancel ] ", no_style),
     ]);
 
     let buttons_para = Paragraph::new(buttons).alignment(Alignment::Center);
@@ -1511,6 +1531,10 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
             "Zip selection, then queue upload (local) or download (remote)",
         ),
         ("X", "Delete all selected files/folders"),
+        (
+            "Backspace",
+            "Delete focused saved connection (startup connections panel)",
+        ),
         ("", ""),
         ("", "── Filtering ──"),
         (":", "Start text filter"),

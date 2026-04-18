@@ -372,6 +372,12 @@ pub struct PendingExtractOperation {
     pub conflict_paths: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub enum PendingDeleteOperation {
+    Files(Vec<(String, bool)>),
+    SavedConnection(SavedConnection),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPanel {
     Local,
@@ -1240,8 +1246,7 @@ pub struct App {
     pub zip_awaiting_second_press: Option<std::time::Instant>,
     pub pending_zip_transfer: bool,
     pub delete_confirm_yes: bool,
-    /// Names (and dir flags) to delete when confirming; built from multi-selection or single cursor.
-    pub delete_targets: Vec<(String, bool)>,
+    pub pending_delete_operation: Option<PendingDeleteOperation>,
     pub extract_conflict_overwrite: bool,
     pub pending_extract_operation: Option<PendingExtractOperation>,
     pub preferences: UserPreferences,
@@ -1315,7 +1320,7 @@ impl App {
             zip_awaiting_second_press: None,
             pending_zip_transfer: false,
             delete_confirm_yes: true,
-            delete_targets: Vec::new(),
+            pending_delete_operation: None,
             extract_conflict_overwrite: true,
             pending_extract_operation: None,
             preferences,
@@ -3449,7 +3454,21 @@ impl App {
             return;
         }
 
-        self.delete_targets = targets;
+        self.pending_delete_operation = Some(PendingDeleteOperation::Files(targets));
+        self.delete_confirm_yes = true;
+        self.mode = AppMode::DeleteConfirm;
+    }
+
+    pub fn show_delete_saved_connection_confirm(&mut self) {
+        let Some(saved) = self
+            .recent_connections
+            .get(self.connection_list_index)
+            .cloned()
+        else {
+            return;
+        };
+
+        self.pending_delete_operation = Some(PendingDeleteOperation::SavedConnection(saved));
         self.delete_confirm_yes = true;
         self.mode = AppMode::DeleteConfirm;
     }
@@ -3523,11 +3542,25 @@ impl App {
         } else {
             AppMode::Normal
         };
-        self.delete_targets.clear();
+        self.pending_delete_operation = None;
     }
 
     pub fn toggle_delete_option(&mut self) {
         self.delete_confirm_yes = !self.delete_confirm_yes;
+    }
+
+    pub fn format_saved_connection_label(saved: &SavedConnection) -> String {
+        format!(
+            "{} ({}@{}:{})",
+            saved.name, saved.username, saved.host, saved.port
+        )
+    }
+
+    fn clamp_recent_connection_panel_index(&mut self) {
+        let total_items = self.recent_connections.len() + 1;
+        self.connection_list_index = self
+            .connection_list_index
+            .min(total_items.saturating_sub(1));
     }
 
     pub fn confirm_delete(&mut self) {
@@ -3536,92 +3569,118 @@ impl App {
             return;
         }
 
-        let targets = std::mem::take(&mut self.delete_targets);
-        if targets.is_empty() {
+        let Some(operation) = self.pending_delete_operation.take() else {
             self.cancel_delete();
             return;
-        }
-
-        let panel = match self.focus {
-            FocusPanel::Local => "local",
-            FocusPanel::Remote => "remote",
-            FocusPanel::ConnectionTabs => {
-                self.cancel_delete();
-                return;
-            }
         };
 
-        let mut failures: Vec<(String, String)> = Vec::new();
-        for (name, is_dir) in &targets {
-            info!("Deleting {} \"{}\" (is_dir: {})", panel, name, is_dir);
-            let one: Result<(), String> = match self.focus {
-                FocusPanel::Local => {
-                    let path = PathBuf::from(&self.local.browser.current_dir).join(name);
-                    debug!("Local delete path: {:?}", path);
-                    if *is_dir {
-                        std::fs::remove_dir_all(&path)
-                    } else {
-                        std::fs::remove_file(&path)
-                    }
-                    .map_err(|e| e.to_string())
+        match operation {
+            PendingDeleteOperation::Files(targets) => {
+                if targets.is_empty() {
+                    self.cancel_delete();
+                    return;
                 }
-                FocusPanel::Remote => {
-                    if let Some(tab) = self.current_tab_mut() {
-                        let remote_path =
-                            format!("{}/{}", tab.browser.current_dir.trim_end_matches('/'), name);
-                        let cmd = if *is_dir {
-                            format!("rm -rf \"{}\"", remote_path)
-                        } else {
-                            format!("rm -f \"{}\"", remote_path)
-                        };
-                        debug!("Remote delete command: {}", cmd);
-                        tab.connection
-                            .exec(&cmd)
-                            .map(|_| ())
+
+                let panel = match self.focus {
+                    FocusPanel::Local => "local",
+                    FocusPanel::Remote => "remote",
+                    FocusPanel::ConnectionTabs => {
+                        self.cancel_delete();
+                        return;
+                    }
+                };
+
+                let mut failures: Vec<(String, String)> = Vec::new();
+                for (name, is_dir) in &targets {
+                    info!("Deleting {} \"{}\" (is_dir: {})", panel, name, is_dir);
+                    let one: Result<(), String> = match self.focus {
+                        FocusPanel::Local => {
+                            let path = PathBuf::from(&self.local.browser.current_dir).join(name);
+                            debug!("Local delete path: {:?}", path);
+                            if *is_dir {
+                                std::fs::remove_dir_all(&path)
+                            } else {
+                                std::fs::remove_file(&path)
+                            }
                             .map_err(|e| e.to_string())
-                    } else {
-                        Ok(())
+                        }
+                        FocusPanel::Remote => {
+                            if let Some(tab) = self.current_tab_mut() {
+                                let remote_path = format!(
+                                    "{}/{}",
+                                    tab.browser.current_dir.trim_end_matches('/'),
+                                    name
+                                );
+                                let cmd = if *is_dir {
+                                    format!("rm -rf \"{}\"", remote_path)
+                                } else {
+                                    format!("rm -f \"{}\"", remote_path)
+                                };
+                                debug!("Remote delete command: {}", cmd);
+                                tab.connection
+                                    .exec(&cmd)
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        FocusPanel::ConnectionTabs => Ok(()),
+                    };
+                    if let Err(e) = one {
+                        failures.push((name.clone(), e));
                     }
                 }
-                FocusPanel::ConnectionTabs => Ok(()),
-            };
-            if let Err(e) = one {
-                failures.push((name.clone(), e));
-            }
-        }
 
-        match self.focus {
-            FocusPanel::Local => {
-                let _ = LocalBrowser::refresh_files(&mut self.local.browser);
-            }
-            FocusPanel::Remote => {
-                if let Some(tab) = self.current_tab_mut() {
-                    let _ = tab.refresh_directory();
+                match self.focus {
+                    FocusPanel::Local => {
+                        let _ = LocalBrowser::refresh_files(&mut self.local.browser);
+                    }
+                    FocusPanel::Remote => {
+                        if let Some(tab) = self.current_tab_mut() {
+                            let _ = tab.refresh_directory();
+                        }
+                    }
+                    FocusPanel::ConnectionTabs => {}
+                }
+
+                let n_ok = targets.len() - failures.len();
+                if failures.is_empty() {
+                    self.error_message = None;
+                    self.status_message = Some(if targets.len() == 1 {
+                        format!("Deleted \"{}\"", targets[0].0)
+                    } else {
+                        format!("Deleted {} items", targets.len())
+                    });
+                } else if n_ok == 0 {
+                    self.error_message = Some(format!("Delete failed: {}", failures[0].1));
+                    self.status_message = None;
+                } else {
+                    self.error_message = Some(format!(
+                        "Deleted {}, {} failed (e.g. {}: {})",
+                        n_ok,
+                        failures.len(),
+                        failures[0].0,
+                        failures[0].1
+                    ));
+                    self.status_message = None;
                 }
             }
-            FocusPanel::ConnectionTabs => {}
-        }
-
-        let n_ok = targets.len() - failures.len();
-        if failures.is_empty() {
-            self.error_message = None;
-            self.status_message = Some(if targets.len() == 1 {
-                format!("Deleted \"{}\"", targets[0].0)
-            } else {
-                format!("Deleted {} items", targets.len())
-            });
-        } else if n_ok == 0 {
-            self.error_message = Some(format!("Delete failed: {}", failures[0].1));
-            self.status_message = None;
-        } else {
-            self.error_message = Some(format!(
-                "Deleted {}, {} failed (e.g. {}: {})",
-                n_ok,
-                failures.len(),
-                failures[0].0,
-                failures[0].1
-            ));
-            self.status_message = None;
+            PendingDeleteOperation::SavedConnection(saved) => {
+                let label = Self::format_saved_connection_label(&saved);
+                match self.db.delete_connection(&saved.id) {
+                    Ok(()) => {
+                        self.refresh_connections();
+                        self.clamp_recent_connection_panel_index();
+                        self.error_message = None;
+                        self.status_message = Some(format!("Deleted connection {}", label));
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Delete failed: {}", e));
+                        self.status_message = None;
+                    }
+                }
+            }
         }
 
         self.cancel_delete();

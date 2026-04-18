@@ -361,13 +361,21 @@ fn handle_connections_panel_keys(app: &mut App, key: KeyEvent) {
                 app.connection_list_index += 1;
             }
         }
+        KeyCode::Backspace => {
+            if app.connection_list_index < app.recent_connections.len() {
+                app.show_delete_saved_connection_confirm();
+            }
+        }
         KeyCode::Enter => {
             if app.connection_list_index == app.recent_connections.len() {
                 app.connection_dialog = ConnectionDialog::new();
                 app.mode = AppMode::ConnectionDialog;
             } else if app.connection_list_index < app.recent_connections.len() {
                 let saved = app.recent_connections[app.connection_list_index].clone();
-                let _ = app.connect_to_saved(&saved);
+                if let Err(e) = app.connect_to_saved(&saved) {
+                    error!("Failed to connect to saved host {}: {}", saved.name, e);
+                    app.error_message = Some(format!("Connection failed: {}", e));
+                }
             }
         }
         _ => {}
