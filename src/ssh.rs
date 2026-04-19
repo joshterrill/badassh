@@ -128,10 +128,9 @@ impl SshConnection {
                                 )),
                             },
                             Ok(false) => {}
-                            Err(load_err) => errors.push(format!(
-                                "macOS keychain agent load: {}",
-                                load_err
-                            )),
+                            Err(load_err) => {
+                                errors.push(format!("macOS keychain agent load: {}", load_err))
+                            }
                         }
                     }
                 }

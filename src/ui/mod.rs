@@ -2,6 +2,7 @@ use crate::app::{
     App, AppMode, DialogField, ExplorerColumns, FileBrowser, FilterMode, FocusPanel, MenuTab,
     PendingDeleteOperation, TerminalFocus, SETTINGS_ROW_COUNT, SETTINGS_ROW_EDITOR,
 };
+use crate::transfer::DownloadProgressSnapshot;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -1659,7 +1660,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" Ready ", Style::default().fg(ACCENT))
     };
 
-    let transfer_status = {
+    let transfer_status = if let Some(progress) = app.transfer_manager.download_progress() {
+        Some(render_download_progress(progress, area.width))
+    } else {
         let items = app.transfer_manager.get_items();
         let active: Vec<_> = items
             .iter()
@@ -1674,9 +1677,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             .collect();
 
         if !active.is_empty() {
-            format!(" {} transfers ", active.len())
+            Some(format!(" {} transfers ", active.len()))
         } else {
-            String::new()
+            None
         }
     };
 
@@ -1701,11 +1704,67 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         area
     };
 
-    let status_line = Line::from(vec![
-        status,
-        Span::styled(transfer_status, Style::default().fg(MENU_SELECTED)),
-    ]);
+    if let Some(transfer_status) = transfer_status {
+        let transfer_width = transfer_status.chars().count() as u16;
+        let reserved = transfer_width.min(status_area.width.saturating_sub(10));
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(reserved)])
+            .split(status_area);
 
-    let status_bar = Paragraph::new(status_line).style(Style::default().bg(MENU_BG));
-    frame.render_widget(status_bar, status_area);
+        let status_bar =
+            Paragraph::new(Line::from(vec![status])).style(Style::default().bg(MENU_BG));
+        frame.render_widget(status_bar, chunks[0]);
+
+        let transfer_bar = Paragraph::new(Span::styled(
+            transfer_status,
+            Style::default().fg(MENU_SELECTED),
+        ))
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(MENU_BG));
+        frame.render_widget(transfer_bar, chunks[1]);
+    } else {
+        let status_bar =
+            Paragraph::new(Line::from(vec![status])).style(Style::default().bg(MENU_BG));
+        frame.render_widget(status_bar, status_area);
+    }
+}
+
+fn render_download_progress(progress: DownloadProgressSnapshot, available_width: u16) -> String {
+    let label = if progress.total_count == 1 {
+        " 1 download ".to_string()
+    } else if progress.active_count == 0 || progress.active_count == progress.total_count {
+        format!(" {} downloads ", progress.total_count)
+    } else {
+        format!(
+            " {}/{} downloads ",
+            progress.active_count, progress.total_count
+        )
+    };
+
+    let ratio = if progress.total_bytes > 0 {
+        progress.bytes_transferred as f64 / progress.total_bytes as f64
+    } else if progress.total_count > 0 {
+        progress.completed_count as f64 / progress.total_count as f64
+    } else {
+        0.0
+    }
+    .clamp(0.0, 1.0);
+
+    let percent = format!(" {:>3.0}% ", ratio * 100.0);
+    let min_bar_width = 8usize;
+    let preferred_bar_width = 18usize;
+    let max_width = available_width.saturating_sub(12) as usize;
+    let fixed_width = label.len() + percent.len() + 2;
+
+    if max_width <= fixed_width + min_bar_width {
+        return format!("{}{}", label, percent);
+    }
+
+    let bar_width = preferred_bar_width.min(max_width.saturating_sub(fixed_width));
+    let filled = ((bar_width as f64) * ratio).round() as usize;
+    let empty = bar_width.saturating_sub(filled);
+    let bar = format!("[{}{}]", "=".repeat(filled), " ".repeat(empty));
+
+    format!("{}{}{}", label, bar, percent)
 }

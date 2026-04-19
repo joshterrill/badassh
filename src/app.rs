@@ -9,7 +9,9 @@ use crate::transfer::{
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
+use ssh2::Sftp;
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -376,6 +378,13 @@ pub struct PendingExtractOperation {
 pub enum PendingDeleteOperation {
     Files(Vec<(String, bool)>),
     SavedConnection(SavedConnection),
+}
+
+#[derive(Debug, Clone)]
+struct DownloadPlanItem {
+    remote_path: String,
+    dest_path: String,
+    total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2656,50 +2665,137 @@ impl App {
             return;
         }
 
-        let (files, session_info, remote_dir) = {
-            if let Some(tab) = self.current_tab() {
-                let files: Vec<_> = tab
-                    .browser
-                    .get_selected_files()
-                    .iter()
-                    .filter(|f| f.name != "..")
-                    .map(|f| (f.name.clone(), f.is_dir))
-                    .collect();
-                (
-                    files,
-                    tab.session_info.clone(),
-                    tab.browser.current_dir.clone(),
-                )
-            } else {
+        let Some(tab) = self.current_tab() else {
+            return;
+        };
+
+        let files: Vec<_> = tab
+            .browser
+            .get_selected_files()
+            .iter()
+            .filter(|f| f.name != "..")
+            .map(|f| (f.name.clone(), f.is_dir, f.size_bytes))
+            .collect();
+        let session_info = tab.session_info.clone();
+        let remote_dir = tab.browser.current_dir.clone();
+        let sftp = match tab.connection.sftp() {
+            Ok(sftp) => sftp,
+            Err(e) => {
+                self.error_message = Some(format!("Cannot start download: {}", e));
                 return;
             }
         };
 
         let local_dir = self.local.browser.current_dir.clone();
+        let mut plans = Vec::new();
 
-        let count = files.len();
+        for (name, is_dir, size_bytes) in &files {
+            let remote_path = format!("{}/{}", remote_dir.trim_end_matches('/'), name);
+            let dest_path = PathBuf::from(&local_dir).join(name);
+            info!("  Download: {} (is_dir: {})", remote_path, is_dir);
+            if let Err(e) = Self::collect_remote_downloads(
+                &sftp,
+                Path::new(&remote_path),
+                &dest_path,
+                *is_dir,
+                *size_bytes,
+                &mut plans,
+            ) {
+                self.error_message = Some(format!("Cannot queue download: {}", e));
+                return;
+            }
+        }
+
+        let count = plans.len();
+        if count == 0 {
+            self.status_message = Some("Created empty local directories".to_string());
+            self.error_message = None;
+            if let Some(tab) = self.current_tab_mut() {
+                tab.browser.clear_selection();
+            }
+            return;
+        }
+
         info!(
             "Queuing {} file(s) for download from {} to {}",
             count, remote_dir, local_dir
         );
 
-        for (name, is_dir) in files {
-            let remote_path = format!("{}/{}", remote_dir.trim_end_matches('/'), name);
-            info!("  Download: {} (is_dir: {})", remote_path, is_dir);
-            self.transfer_manager.queue_download(
+        for plan in plans {
+            self.transfer_manager.queue_download_to_path(
                 session_info.clone(),
-                remote_path,
-                local_dir.clone(),
-                is_dir,
+                plan.remote_path,
+                plan.dest_path,
+                false,
+                Some(plan.total_bytes),
             );
         }
 
-        self.status_message = Some(format!("Queued {} item(s) for download", count));
+        self.status_message = Some(format!("Queued {} file(s) for download", count));
         self.error_message = None;
 
         if let Some(tab) = self.current_tab_mut() {
             tab.browser.clear_selection();
         }
+    }
+
+    fn collect_remote_downloads(
+        sftp: &Sftp,
+        remote_path: &Path,
+        local_path: &Path,
+        is_dir: bool,
+        known_size: Option<u64>,
+        plans: &mut Vec<DownloadPlanItem>,
+    ) -> Result<()> {
+        if is_dir {
+            fs::create_dir_all(local_path)?;
+            let entries = sftp.readdir(remote_path)?;
+
+            for (path, stat) in entries {
+                let filename = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                if filename == "." || filename == ".." {
+                    continue;
+                }
+
+                let child_remote = path;
+                let child_local = local_path.join(&filename);
+                Self::collect_remote_downloads(
+                    sftp,
+                    &child_remote,
+                    &child_local,
+                    stat.is_dir(),
+                    stat.size,
+                    plans,
+                )?;
+            }
+
+            return Ok(());
+        }
+
+        if let Some(parent) = local_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let total_bytes = match known_size {
+            Some(size) => size,
+            None => sftp
+                .stat(remote_path)
+                .ok()
+                .and_then(|stat| stat.size)
+                .unwrap_or(0),
+        };
+
+        plans.push(DownloadPlanItem {
+            remote_path: remote_path.to_string_lossy().to_string(),
+            dest_path: local_path.to_string_lossy().to_string(),
+            total_bytes,
+        });
+
+        Ok(())
     }
 
     pub fn upload_selected(&mut self) {

@@ -48,7 +48,26 @@ pub struct TransferManager {
     items: Arc<Mutex<Vec<TransferItem>>>,
     next_id: Arc<Mutex<usize>>,
     active_transfers: Arc<Mutex<usize>>,
+    download_progress: Arc<Mutex<DownloadProgressState>>,
     max_parallel: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DownloadProgressState {
+    total_count: usize,
+    completed_count: usize,
+    active_count: usize,
+    total_bytes: u64,
+    bytes_transferred: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadProgressSnapshot {
+    pub total_count: usize,
+    pub completed_count: usize,
+    pub active_count: usize,
+    pub total_bytes: u64,
+    pub bytes_transferred: u64,
 }
 
 impl TransferManager {
@@ -57,6 +76,7 @@ impl TransferManager {
             items: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(Mutex::new(1)),
             active_transfers: Arc::new(Mutex::new(0)),
+            download_progress: Arc::new(Mutex::new(DownloadProgressState::default())),
             max_parallel,
         }
     }
@@ -70,6 +90,7 @@ impl TransferManager {
         *self.active_transfers.lock() > 0
     }
 
+    #[allow(dead_code)]
     pub fn queue_download(
         &self,
         sftp_session: SftpSessionInfo,
@@ -77,19 +98,30 @@ impl TransferManager {
         local_dir: String,
         is_dir: bool,
     ) -> usize {
-        let id = {
-            let mut next_id = self.next_id.lock();
-            let id = *next_id;
-            *next_id += 1;
-            id
-        };
-
         let filename = Path::new(&remote_path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "download".to_string());
 
         let dest_path = format!("{}/{}", local_dir.trim_end_matches('/'), filename);
+
+        self.queue_download_to_path(sftp_session, remote_path, dest_path, is_dir, None)
+    }
+
+    pub fn queue_download_to_path(
+        &self,
+        sftp_session: SftpSessionInfo,
+        remote_path: String,
+        dest_path: String,
+        is_dir: bool,
+        total_bytes: Option<u64>,
+    ) -> usize {
+        let id = {
+            let mut next_id = self.next_id.lock();
+            let id = *next_id;
+            *next_id += 1;
+            id
+        };
 
         info!("Queuing download #{}: {} -> {}", id, remote_path, dest_path);
 
@@ -100,15 +132,22 @@ impl TransferManager {
             is_download: true,
             is_dir,
             status: TransferStatus::Pending,
-            total_bytes: 0,
+            total_bytes: total_bytes.unwrap_or(0),
             bytes_transferred: 0,
         };
 
         self.items.lock().push(item);
+        if !is_dir {
+            let mut progress = self.download_progress.lock();
+            progress.total_count += 1;
+            progress.active_count += 1;
+            progress.total_bytes += total_bytes.unwrap_or(0);
+        }
 
         // Start the transfer in a background thread
         let items = Arc::clone(&self.items);
         let active = Arc::clone(&self.active_transfers);
+        let download_progress = Arc::clone(&self.download_progress);
         let max_parallel = self.max_parallel;
 
         thread::spawn(move || {
@@ -124,14 +163,18 @@ impl TransferManager {
                 thread::sleep(std::time::Duration::from_millis(100));
             }
 
-            let result =
-                Self::execute_download(&items, id, &sftp_session, &remote_path, &dest_path, is_dir);
+            let result = Self::execute_download(
+                &items,
+                &download_progress,
+                id,
+                &sftp_session,
+                &remote_path,
+                &dest_path,
+                is_dir,
+            );
 
             if let Err(e) = result {
-                let mut items_guard = items.lock();
-                if let Some(item) = items_guard.iter_mut().find(|i| i.id == id) {
-                    item.status = TransferStatus::Failed(e.to_string());
-                }
+                Self::mark_download_failed(&items, &download_progress, id, e.to_string());
             }
 
             *active.lock() -= 1;
@@ -221,6 +264,7 @@ impl TransferManager {
 
     fn execute_download(
         items: &Arc<Mutex<Vec<TransferItem>>>,
+        download_progress: &Arc<Mutex<DownloadProgressState>>,
         id: usize,
         session_info: &SftpSessionInfo,
         remote_path: &str,
@@ -276,18 +320,22 @@ impl TransferManager {
             let sftp = session.sftp().context("Failed to create SFTP session")?;
 
             let result = if is_dir {
-                Self::download_directory(items, id, &sftp, remote_path, local_path)
+                Self::download_directory(
+                    items,
+                    download_progress,
+                    id,
+                    &sftp,
+                    remote_path,
+                    local_path,
+                )
             } else {
-                Self::download_file(items, id, &sftp, remote_path, local_path)
+                Self::download_file(items, download_progress, id, &sftp, remote_path, local_path)
             };
 
             match result {
                 Ok(()) => {
                     info!("Download #{} completed successfully: {}", id, local_path);
-                    let mut items_guard = items.lock();
-                    if let Some(item) = items_guard.iter_mut().find(|i| i.id == id) {
-                        item.status = TransferStatus::Completed;
-                    }
+                    Self::mark_download_completed(items, download_progress, id);
                     return Ok(());
                 }
                 Err(e) => {
@@ -315,6 +363,7 @@ impl TransferManager {
 
     fn download_file(
         items: &Arc<Mutex<Vec<TransferItem>>>,
+        download_progress: &Arc<Mutex<DownloadProgressState>>,
         id: usize,
         sftp: &Sftp,
         remote_path: &str,
@@ -335,13 +384,17 @@ impl TransferManager {
             .context("Failed to stat remote file")?;
         let total_bytes = stat.size.unwrap_or(0);
 
-        // Update total bytes
-        {
-            let mut items_guard = items.lock();
-            if let Some(item) = items_guard.iter_mut().find(|i| i.id == id) {
-                item.total_bytes = total_bytes;
-            }
-        }
+        Self::update_download_progress(
+            items,
+            download_progress,
+            id,
+            total_bytes,
+            0,
+            TransferStatus::InProgress {
+                bytes_transferred: 0,
+                total_bytes,
+            },
+        );
 
         // Check if temp file exists with partial data
         let resume_position = if temp_path.exists() {
@@ -373,6 +426,17 @@ impl TransferManager {
         };
 
         let mut bytes_transferred = resume_position;
+        Self::update_download_progress(
+            items,
+            download_progress,
+            id,
+            total_bytes,
+            bytes_transferred,
+            TransferStatus::InProgress {
+                bytes_transferred,
+                total_bytes,
+            },
+        );
         let mut buffer = vec![0u8; CHUNK_SIZE];
 
         loop {
@@ -384,17 +448,17 @@ impl TransferManager {
             local_file.write_all(&buffer[..bytes_read])?;
             bytes_transferred += bytes_read as u64;
 
-            // Update progress
-            {
-                let mut items_guard = items.lock();
-                if let Some(item) = items_guard.iter_mut().find(|i| i.id == id) {
-                    item.bytes_transferred = bytes_transferred;
-                    item.status = TransferStatus::InProgress {
-                        bytes_transferred,
-                        total_bytes,
-                    };
-                }
-            }
+            Self::update_download_progress(
+                items,
+                download_progress,
+                id,
+                total_bytes,
+                bytes_transferred,
+                TransferStatus::InProgress {
+                    bytes_transferred,
+                    total_bytes,
+                },
+            );
         }
 
         // Sync and close
@@ -409,6 +473,7 @@ impl TransferManager {
 
     fn download_directory(
         items: &Arc<Mutex<Vec<TransferItem>>>,
+        download_progress: &Arc<Mutex<DownloadProgressState>>,
         id: usize,
         sftp: &Sftp,
         remote_path: &str,
@@ -433,13 +498,136 @@ impl TransferManager {
             let local_entry = local_path.join(&*filename).to_string_lossy().to_string();
 
             if stat.is_dir() {
-                Self::download_directory(items, id, sftp, &remote_entry, &local_entry)?;
+                Self::download_directory(
+                    items,
+                    download_progress,
+                    id,
+                    sftp,
+                    &remote_entry,
+                    &local_entry,
+                )?;
             } else {
-                Self::download_file(items, id, sftp, &remote_entry, &local_entry)?;
+                Self::download_file(
+                    items,
+                    download_progress,
+                    id,
+                    sftp,
+                    &remote_entry,
+                    &local_entry,
+                )?;
             }
         }
 
         Ok(())
+    }
+
+    fn update_download_progress(
+        items: &Arc<Mutex<Vec<TransferItem>>>,
+        download_progress: &Arc<Mutex<DownloadProgressState>>,
+        id: usize,
+        total_bytes: u64,
+        bytes_transferred: u64,
+        status: TransferStatus,
+    ) {
+        let (total_delta, bytes_delta) = {
+            let mut items_guard = items.lock();
+            if let Some(item) = items_guard.iter_mut().find(|i| i.id == id) {
+                let previous_total = item.total_bytes;
+                let previous_bytes = item.bytes_transferred;
+                item.total_bytes = total_bytes;
+                item.bytes_transferred = bytes_transferred;
+                item.status = status;
+                (
+                    total_bytes as i128 - previous_total as i128,
+                    bytes_transferred as i128 - previous_bytes as i128,
+                )
+            } else {
+                (0, 0)
+            }
+        };
+
+        if total_delta != 0 || bytes_delta != 0 {
+            let mut progress = download_progress.lock();
+            if total_delta >= 0 {
+                progress.total_bytes += total_delta as u64;
+            } else {
+                progress.total_bytes = progress.total_bytes.saturating_sub((-total_delta) as u64);
+            }
+
+            if bytes_delta >= 0 {
+                progress.bytes_transferred += bytes_delta as u64;
+            } else {
+                progress.bytes_transferred = progress
+                    .bytes_transferred
+                    .saturating_sub((-bytes_delta) as u64);
+            }
+        }
+    }
+
+    fn mark_download_completed(
+        items: &Arc<Mutex<Vec<TransferItem>>>,
+        download_progress: &Arc<Mutex<DownloadProgressState>>,
+        id: usize,
+    ) {
+        let final_delta = {
+            let mut items_guard = items.lock();
+            if let Some(item) = items_guard.iter_mut().find(|i| i.id == id) {
+                let delta = item.total_bytes.saturating_sub(item.bytes_transferred);
+                item.bytes_transferred = item.total_bytes;
+                item.status = TransferStatus::Completed;
+                Some(delta)
+            } else {
+                None
+            }
+        };
+
+        if let Some(final_delta) = final_delta {
+            let mut progress = download_progress.lock();
+            progress.bytes_transferred += final_delta;
+            progress.completed_count += 1;
+            progress.active_count = progress.active_count.saturating_sub(1);
+        }
+    }
+
+    fn mark_download_failed(
+        items: &Arc<Mutex<Vec<TransferItem>>>,
+        download_progress: &Arc<Mutex<DownloadProgressState>>,
+        id: usize,
+        error: String,
+    ) {
+        let removed = {
+            let mut items_guard = items.lock();
+            if let Some(item) = items_guard.iter_mut().find(|i| i.id == id) {
+                item.status = TransferStatus::Failed(error);
+                Some((item.total_bytes, item.bytes_transferred))
+            } else {
+                None
+            }
+        };
+
+        if let Some((total_bytes, bytes_transferred)) = removed {
+            let mut progress = download_progress.lock();
+            progress.active_count = progress.active_count.saturating_sub(1);
+            progress.total_count = progress.total_count.saturating_sub(1);
+            progress.total_bytes = progress.total_bytes.saturating_sub(total_bytes);
+            progress.bytes_transferred =
+                progress.bytes_transferred.saturating_sub(bytes_transferred);
+        }
+    }
+
+    pub fn download_progress(&self) -> Option<DownloadProgressSnapshot> {
+        let progress = self.download_progress.lock();
+        if progress.total_count == 0 {
+            return None;
+        }
+
+        Some(DownloadProgressSnapshot {
+            total_count: progress.total_count,
+            completed_count: progress.completed_count,
+            active_count: progress.active_count,
+            total_bytes: progress.total_bytes,
+            bytes_transferred: progress.bytes_transferred,
+        })
     }
 
     fn execute_upload(
@@ -714,6 +902,20 @@ impl TransferManager {
                 TransferStatus::Completed | TransferStatus::Failed(_)
             )
         });
+        drop(items);
+
+        let has_downloads = self.items.lock().iter().any(|item| {
+            item.is_download
+                && matches!(
+                    item.status,
+                    TransferStatus::Pending
+                        | TransferStatus::InProgress { .. }
+                        | TransferStatus::Retrying { .. }
+                )
+        });
+        if !has_downloads {
+            *self.download_progress.lock() = DownloadProgressState::default();
+        }
     }
 }
 
