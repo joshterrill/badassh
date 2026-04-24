@@ -387,6 +387,13 @@ struct DownloadPlanItem {
     total_bytes: u64,
 }
 
+#[derive(Debug, Clone)]
+struct UploadPlanItem {
+    local_path: String,
+    remote_path: String,
+    total_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPanel {
     Local,
@@ -1291,6 +1298,10 @@ impl App {
         let preferences = UserPreferences::load_from_db(&db, &default_editor)?;
         let local = LocalBrowser::new(preferences.explorer_sort)?;
 
+        let parallel_transfers = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get().clamp(4, 8))
+            .unwrap_or(4);
+
         Ok(Self {
             running: true,
             mode: AppMode::Normal,
@@ -1318,7 +1329,7 @@ impl App {
             visible_file_rows: 10,
             visible_local_terminal_rows: 1,
             visible_remote_terminal_rows: 1,
-            transfer_manager: TransferManager::new(4),
+            transfer_manager: TransferManager::new(parallel_transfers),
             editor_manager: EditorManager::new()?,
             directory_input: String::new(),
             directory_completions: Vec::new(),
@@ -2656,6 +2667,7 @@ impl App {
                 upload.local_path.to_string_lossy().to_string(),
                 upload.remote_path,
                 false,
+                None,
             );
         }
     }
@@ -2818,34 +2830,144 @@ impl App {
 
         let local_dir = self.local.browser.current_dir.clone();
 
-        let (session_info, remote_dir) = {
+        let (session_info, remote_dir, sftp) = {
             if let Some(tab) = self.current_tab() {
-                (tab.session_info.clone(), tab.browser.current_dir.clone())
+                let sftp = match tab.connection.sftp() {
+                    Ok(sftp) => sftp,
+                    Err(e) => {
+                        self.error_message = Some(format!("Cannot start upload: {}", e));
+                        return;
+                    }
+                };
+                (
+                    tab.session_info.clone(),
+                    tab.browser.current_dir.clone(),
+                    sftp,
+                )
             } else {
                 return;
             }
         };
 
-        let count = files.len();
+        let mut file_plans = Vec::new();
+        let mut remote_directories = HashSet::new();
+
+        for (name, is_dir) in &files {
+            let local_path = PathBuf::from(&local_dir).join(name);
+            let remote_path = Path::new(&remote_dir).join(name);
+            info!("  Upload: {} (is_dir: {})", local_path.display(), is_dir);
+
+            if let Err(e) = Self::collect_local_uploads(
+                &local_path,
+                &remote_path,
+                *is_dir,
+                &mut remote_directories,
+                &mut file_plans,
+            ) {
+                self.error_message = Some(format!("Cannot queue upload: {}", e));
+                return;
+            }
+        }
+
+        if let Err(e) = Self::create_remote_directories(&sftp, &remote_directories) {
+            self.error_message = Some(format!("Cannot create remote directories: {}", e));
+            return;
+        }
+
+        let count = file_plans.len();
         info!(
             "Queuing {} file(s) for upload from {} to {}",
             count, local_dir, remote_dir
         );
 
-        for (name, is_dir) in files {
-            let local_path = format!("{}/{}", local_dir.trim_end_matches('/'), name);
-            info!("  Upload: {} (is_dir: {})", local_path, is_dir);
-            self.transfer_manager.queue_upload(
+        if count == 0 {
+            self.status_message = Some("Created empty remote directories".to_string());
+            self.error_message = None;
+            self.local.browser.clear_selection();
+            return;
+        }
+
+        for plan in file_plans {
+            self.transfer_manager.queue_upload_to_path(
                 session_info.clone(),
-                local_path,
-                remote_dir.clone(),
-                is_dir,
+                plan.local_path,
+                plan.remote_path,
+                false,
+                Some(plan.total_bytes),
             );
         }
 
-        self.status_message = Some(format!("Queued {} item(s) for upload", count));
+        self.status_message = Some(format!("Queued {} file(s) for upload", count));
         self.error_message = None;
         self.local.browser.clear_selection();
+    }
+
+    fn collect_local_uploads(
+        local_path: &Path,
+        remote_path: &Path,
+        is_dir: bool,
+        remote_directories: &mut HashSet<String>,
+        plans: &mut Vec<UploadPlanItem>,
+    ) -> Result<()> {
+        if is_dir {
+            remote_directories.insert(remote_path.to_string_lossy().to_string());
+
+            for entry in fs::read_dir(local_path)? {
+                let entry = entry?;
+                let child_local = entry.path();
+                let child_remote = remote_path.join(entry.file_name());
+                Self::collect_local_uploads(
+                    &child_local,
+                    &child_remote,
+                    entry.file_type()?.is_dir(),
+                    remote_directories,
+                    plans,
+                )?;
+            }
+
+            return Ok(());
+        }
+
+        let total_bytes = fs::metadata(local_path)?.len();
+        plans.push(UploadPlanItem {
+            local_path: local_path.to_string_lossy().to_string(),
+            remote_path: remote_path.to_string_lossy().to_string(),
+            total_bytes,
+        });
+        Ok(())
+    }
+
+    fn create_remote_directories(sftp: &Sftp, remote_directories: &HashSet<String>) -> Result<()> {
+        let mut directories: Vec<_> = remote_directories.iter().map(PathBuf::from).collect();
+        directories.sort_by_key(|path| path.components().count());
+
+        for directory in directories {
+            Self::create_remote_directory(sftp, &directory)?;
+        }
+
+        Ok(())
+    }
+
+    fn create_remote_directory(sftp: &Sftp, remote_path: &Path) -> Result<()> {
+        if remote_path.as_os_str().is_empty() || remote_path == Path::new("/") {
+            return Ok(());
+        }
+
+        if sftp.stat(remote_path).is_ok() {
+            return Ok(());
+        }
+
+        if let Some(parent) = remote_path.parent() {
+            if !parent.as_os_str().is_empty() && parent != remote_path {
+                Self::create_remote_directory(sftp, parent)?;
+            }
+        }
+
+        match sftp.mkdir(remote_path, 0o755) {
+            Ok(()) => Ok(()),
+            Err(_err) if sftp.stat(remote_path).is_ok() => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub fn handle_zip_press(&mut self) {
@@ -3490,27 +3612,31 @@ impl App {
                     if file.is_dir {
                         LocalBrowser::change_directory(&mut self.local.browser, &file.name)?;
                         self.update_local_watcher();
-                    } else {
-                        // Open file in editor
-                        self.open_selected();
+                        self.error_message = None;
+                        self.status_message = None;
+                        return Ok(());
                     }
+
+                    // Open file in editor
+                    self.open_selected();
                 }
             }
             FocusPanel::Remote => {
-                if let Some(tab) = self.current_tab_mut() {
-                    if let Some(file) = tab.browser.selected_file().cloned() {
-                        if file.is_dir {
+                let selected_file = self
+                    .current_tab()
+                    .and_then(|tab| tab.browser.selected_file().cloned());
+
+                if let Some(file) = selected_file {
+                    if file.is_dir {
+                        if let Some(tab) = self.current_tab_mut() {
                             tab.change_directory(&file.name)?;
                         }
+                        self.error_message = None;
+                        self.status_message = None;
+                        return Ok(());
                     }
-                }
-                // Check if it was a file and open it
-                if let Some(tab) = self.current_tab() {
-                    if let Some(file) = tab.browser.selected_file() {
-                        if !file.is_dir {
-                            self.open_selected();
-                        }
-                    }
+
+                    self.open_selected();
                 }
             }
             FocusPanel::ConnectionTabs => {}

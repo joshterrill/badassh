@@ -2,7 +2,7 @@ use crate::app::{
     App, AppMode, DialogField, ExplorerColumns, FileBrowser, FilterMode, FocusPanel, MenuTab,
     PendingDeleteOperation, TerminalFocus, SETTINGS_ROW_COUNT, SETTINGS_ROW_EDITOR,
 };
-use crate::transfer::DownloadProgressSnapshot;
+use crate::transfer::TransferProgressSnapshot;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -1660,8 +1660,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" Ready ", Style::default().fg(ACCENT))
     };
 
-    let transfer_status = if let Some(progress) = app.transfer_manager.download_progress() {
-        Some(render_download_progress(progress, area.width))
+    let transfer_status = if let Some(progress) = app.transfer_manager.transfer_progress() {
+        Some(render_transfer_progress(progress, area.width))
     } else {
         let items = app.transfer_manager.get_items();
         let active: Vec<_> = items
@@ -1730,15 +1730,21 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_download_progress(progress: DownloadProgressSnapshot, available_width: u16) -> String {
+fn render_transfer_progress(progress: TransferProgressSnapshot, available_width: u16) -> String {
+    let (singular, plural) = match (progress.download_count > 0, progress.upload_count > 0) {
+        (true, false) => ("download", "downloads"),
+        (false, true) => ("upload", "uploads"),
+        _ => ("transfer", "transfers"),
+    };
+
     let label = if progress.total_count == 1 {
-        " 1 download ".to_string()
-    } else if progress.active_count == 0 || progress.active_count == progress.total_count {
-        format!(" {} downloads ", progress.total_count)
+        format!(" 1 {} ", singular)
+    } else if progress.completed_count == 0 {
+        format!(" {} {} ", progress.total_count, plural)
     } else {
         format!(
-            " {}/{} downloads ",
-            progress.active_count, progress.total_count
+            " {}/{} {} ",
+            progress.completed_count, progress.total_count, plural
         )
     };
 
