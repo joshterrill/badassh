@@ -715,7 +715,7 @@ fn handle_local_panel_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Char('u') | KeyCode::Char('U') => app.upload_selected(),
         KeyCode::Char('z') | KeyCode::Char('Z') => app.handle_zip_press(),
         KeyCode::Char('x') | KeyCode::Char('X') => app.show_delete_confirm(),
-        KeyCode::Char('`') => {
+        KeyCode::Char('`') | KeyCode::Char('~') => {
             app.toggle_local_terminal();
             if app.local_terminal_visible {
                 app.terminal_focus = TerminalFocus::LocalTerminal;
@@ -846,7 +846,7 @@ fn handle_remote_panel_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Char('e') | KeyCode::Char('E') => app.extract_selected(),
         KeyCode::Char('z') | KeyCode::Char('Z') => app.handle_zip_press(),
         KeyCode::Char('x') | KeyCode::Char('X') => app.show_delete_confirm(),
-        KeyCode::Char('`') => {
+        KeyCode::Char('`') | KeyCode::Char('~') => {
             app.toggle_remote_terminal();
             if app.is_remote_terminal_visible() {
                 app.terminal_focus = TerminalFocus::RemoteTerminal;
@@ -938,7 +938,7 @@ fn handle_file_browser_keys(app: &mut App, key: KeyEvent) {
         KeyCode::Char('e') | KeyCode::Char('E') => app.extract_selected(),
         KeyCode::Char('z') | KeyCode::Char('Z') => app.handle_zip_press(),
         KeyCode::Char('x') | KeyCode::Char('X') => app.show_delete_confirm(),
-        KeyCode::Char('`') => {
+        KeyCode::Char('`') | KeyCode::Char('~') => {
             app.toggle_local_terminal();
             if app.local_terminal_visible {
                 app.terminal_focus = TerminalFocus::LocalTerminal;

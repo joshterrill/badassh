@@ -1555,7 +1555,7 @@ fn draw_keyboard_shortcuts(frame: &mut Frame, app: &mut App) {
         ),
         ("", ""),
         ("", "── Terminal ──"),
-        ("`", "Toggle and focus terminal"),
+        ("` / ~", "Toggle and focus terminal"),
         ("Esc", "Unfocus terminal"),
         (
             "Ctrl+↑/Ctrl+↓",

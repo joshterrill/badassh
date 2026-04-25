@@ -877,7 +877,7 @@ impl RemoteTerminal {
             key_path: session_info.key_path.clone(),
         };
 
-        let session = open_ssh_session(&params, false)?;
+        let session = open_ssh_session(&params, true)?;
         let mut channel = session.channel_session()?;
         channel.request_pty(
             "xterm-256color",
@@ -885,6 +885,7 @@ impl RemoteTerminal {
             Some((cols as u32, rows as u32, 0, 0)),
         )?;
         channel.shell()?;
+        session.set_blocking(false);
         Ok((session, channel))
     }
 
