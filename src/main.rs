@@ -274,6 +274,7 @@ fn send_to_terminal(app: &mut App, data: &str) {
             if let Some(term) = &mut app.local_terminal {
                 if let Err(e) = term.send_key(data) {
                     error!("Failed to send to local terminal: {}", e);
+                    app.error_message = Some(format!("Local terminal error: {}", e));
                 }
                 term.scroll_to_bottom();
             }
@@ -283,6 +284,8 @@ fn send_to_terminal(app: &mut App, data: &str) {
                 if let Some(term) = &mut tab.remote_terminal {
                     if let Err(e) = term.send_key(data) {
                         error!("Failed to send to remote terminal: {}", e);
+                        app.error_message =
+                            Some(format!("Remote terminal error for {}: {}", tab.name, e));
                     }
                     term.scroll_to_bottom();
                 }

@@ -1876,7 +1876,20 @@ impl App {
     pub fn poll_remote_terminals(&mut self) {
         for tab in &mut self.tabs {
             if let Some(term) = &mut tab.remote_terminal {
-                term.poll_read();
+                match term.poll_read() {
+                    Ok(Some(message)) => {
+                        self.status_message = Some(message);
+                        self.error_message = None;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        self.status_message = None;
+                        self.error_message = Some(format!(
+                            "Remote terminal reconnect failed for {}: {}",
+                            tab.name, e
+                        ));
+                    }
+                }
             }
         }
     }

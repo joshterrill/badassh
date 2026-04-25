@@ -4,15 +4,15 @@ use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtyPair, PtySize};
 use ssh2::{Channel, Session};
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
 use vte::{Params, Parser, Perform};
 
+use crate::ssh::{open_ssh_session, ConnectionParams};
 use crate::transfer::SftpSessionInfo;
 
 /// Decode minimal `%XX` sequences in a path from an OSC 7 `file:` URI.
@@ -64,6 +64,8 @@ fn path_from_osc7_file_uri(uri: &str) -> Option<String> {
 const MAX_SCROLLBACK: usize = 5000;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
+const REMOTE_RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
+const REMOTE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Virtual document is scrollback rows (oldest first) then live screen rows (`screen_rows` lines).
 /// Returns `(total_lines, index_of_top_visible_line)` for the current `scroll_offset` and viewport height.
@@ -380,6 +382,16 @@ impl TerminalScreen {
         }
 
         lines
+    }
+
+    fn push_status_message(&mut self, message: &str) {
+        self.carriage_return();
+        self.newline();
+        for c in format!("[badassh] {}", message).chars() {
+            self.put_char(c);
+        }
+        self.carriage_return();
+        self.newline();
     }
 }
 
@@ -789,6 +801,8 @@ impl Drop for LocalTerminal {
 }
 
 pub struct RemoteTerminal {
+    session_info: SftpSessionInfo,
+    session: Session,
     channel: Channel,
     screen: Arc<Mutex<TerminalScreen>>,
     /// Must persist across `poll_read` calls so OSC sequences can span TCP chunks.
@@ -798,6 +812,11 @@ pub struct RemoteTerminal {
     running: Arc<AtomicBool>,
     cols: u16,
     rows: u16,
+    desired_dir: String,
+    disconnected: bool,
+    disconnect_reason: Option<String>,
+    next_reconnect_at: Instant,
+    last_keepalive_at: Instant,
 }
 
 impl RemoteTerminal {
@@ -815,57 +834,7 @@ impl RemoteTerminal {
             "Creating remote terminal for {}@{} ({}x{})",
             session_info.username, session_info.host, cols, rows
         );
-
-        let addr = format!("{}:{}", session_info.host, session_info.port);
-        let tcp =
-            TcpStream::connect(&addr).with_context(|| format!("Failed to connect to {}", addr))?;
-
-        let tcp_clone = tcp.try_clone()?;
-
-        let mut session = Session::new()?;
-        session.set_tcp_stream(tcp);
-        session.handshake()?;
-
-        if session.userauth_agent(&session_info.username).is_ok() && session.authenticated() {
-        } else if let Some(ref password) = session_info.password {
-            session.userauth_password(&session_info.username, password)?;
-        } else if let Some(ref key_path) = session_info.key_path {
-            let key = PathBuf::from(key_path);
-            session.userauth_pubkey_file(&session_info.username, None, &key, None)?;
-        } else if let Some(home) = dirs::home_dir() {
-            let ssh_dir = home.join(".ssh");
-            let mut authenticated = false;
-            for key_name in &["id_ed25519", "id_rsa", "id_ecdsa"] {
-                let key_path = ssh_dir.join(key_name);
-                if key_path.exists() {
-                    if session
-                        .userauth_pubkey_file(&session_info.username, None, &key_path, None)
-                        .is_ok()
-                    {
-                        authenticated = true;
-                        break;
-                    }
-                }
-            }
-            if !authenticated {
-                anyhow::bail!("Authentication failed");
-            }
-        }
-
-        if !session.authenticated() {
-            anyhow::bail!("Authentication failed");
-        }
-
-        let mut channel = session.channel_session()?;
-        channel.request_pty(
-            "xterm-256color",
-            None,
-            Some((cols as u32, rows as u32, 0, 0)),
-        )?;
-        channel.shell()?;
-
-        tcp_clone.set_nonblocking(true)?;
-        session.set_blocking(false);
+        let (session, channel) = Self::open_channel(session_info, cols, rows)?;
 
         let screen = Arc::new(Mutex::new(TerminalScreen::new(
             cols as usize,
@@ -874,6 +843,8 @@ impl RemoteTerminal {
         let running = Arc::new(AtomicBool::new(true));
 
         let mut terminal = Self {
+            session_info: session_info.clone(),
+            session,
             channel,
             screen,
             parser: Parser::new(),
@@ -881,46 +852,60 @@ impl RemoteTerminal {
             running,
             cols,
             rows,
+            desired_dir: initial_dir.to_string(),
+            disconnected: false,
+            disconnect_reason: None,
+            next_reconnect_at: Instant::now(),
+            last_keepalive_at: Instant::now(),
         };
         terminal.inject_remote_cwd_hooks()?;
         terminal.set_working_dir(initial_dir)?;
-        terminal.write(b"__badassh_cwd\r")?;
+        terminal.write_raw(b"__badassh_cwd\r")?;
         Ok(terminal)
+    }
+
+    fn open_channel(
+        session_info: &SftpSessionInfo,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(Session, Channel)> {
+        let params = ConnectionParams {
+            host: session_info.host.clone(),
+            port: session_info.port,
+            username: session_info.username.clone(),
+            password: session_info.password.clone(),
+            key_path: session_info.key_path.clone(),
+        };
+
+        let session = open_ssh_session(&params, false)?;
+        let mut channel = session.channel_session()?;
+        channel.request_pty(
+            "xterm-256color",
+            None,
+            Some((cols as u32, rows as u32, 0, 0)),
+        )?;
+        channel.shell()?;
+        Ok((session, channel))
+    }
+
+    fn reconnect_dir(&self) -> String {
+        self.screen
+            .lock()
+            .last_reported_cwd
+            .clone()
+            .filter(|dir| !dir.is_empty())
+            .unwrap_or_else(|| self.desired_dir.clone())
     }
 
     /// bash/zsh hooks that emit OSC 7 before each prompt so we can sync the remote file explorer.
     fn inject_remote_cwd_hooks(&mut self) -> Result<()> {
         const HOOK: &[u8] = b"__badassh_cwd(){ printf '\\033]7;file://%s%s\\a' \"${HOSTNAME:-localhost}\" \"$(printf %s \"$PWD\" | sed 's/ /%20/g')\"; }; [ -n \"${ZSH_VERSION:-}\" ] && precmd_functions+=(__badassh_cwd); [ -n \"${BASH_VERSION:-}\" ] && PROMPT_COMMAND=\"__badassh_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\";";
-        self.write(HOOK)?;
-        self.write(b"\r")?;
+        self.write_raw(HOOK)?;
+        self.write_raw(b"\r")?;
         Ok(())
     }
 
-    pub fn poll_read(&mut self) {
-        let mut buf = [0u8; 8192];
-        let mut screen = self.screen.lock();
-
-        for _ in 0..3 {
-            match self.channel.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    for byte in &buf[..n] {
-                        self.parser.advance(&mut *screen, *byte);
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    }
-
-    /// Latest absolute path reported by the remote shell via OSC 7 (see `inject_remote_cwd_hooks`).
-    pub fn try_reported_cwd(&self) -> Option<String> {
-        self.screen.lock().last_reported_cwd.clone()
-    }
-
-    pub fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.poll_read();
-
+    fn write_raw(&mut self, data: &[u8]) -> Result<()> {
         for attempt in 0..5 {
             match self.channel.write(data) {
                 Ok(_) => {
@@ -929,10 +914,9 @@ impl RemoteTerminal {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if attempt < 4 {
-                        self.poll_read();
-                        std::thread::sleep(Duration::from_millis(1));
+                        thread::sleep(Duration::from_millis(1));
                     } else {
-                        return Err(anyhow::anyhow!("Channel busy, try again"));
+                        anyhow::bail!("Channel busy, try again");
                     }
                 }
                 Err(e) => return Err(anyhow::anyhow!("Failed to write: {}", e)),
@@ -941,11 +925,168 @@ impl RemoteTerminal {
         Ok(())
     }
 
+    fn append_status_message(&mut self, message: &str) {
+        self.screen.lock().push_status_message(message);
+    }
+
+    fn sync_desired_dir_from_screen(&mut self) {
+        if let Some(cwd) = self.screen.lock().last_reported_cwd.clone() {
+            if !cwd.is_empty() {
+                self.desired_dir = cwd;
+            }
+        }
+    }
+
+    fn mark_disconnected(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if !self.disconnected {
+            info!(
+                "Remote terminal disconnected for {}@{}:{}: {}",
+                self.session_info.username, self.session_info.host, self.session_info.port, reason
+            );
+        }
+        self.disconnected = true;
+        self.disconnect_reason = Some(reason);
+        self.next_reconnect_at = Instant::now();
+    }
+
+    fn reconnect(&mut self, force: bool) -> Result<Option<String>> {
+        if !self.disconnected {
+            return Ok(None);
+        }
+
+        let now = Instant::now();
+        if !force && now < self.next_reconnect_at {
+            return Ok(None);
+        }
+
+        let reconnect_dir = self.reconnect_dir();
+        let reason = self
+            .disconnect_reason
+            .clone()
+            .unwrap_or_else(|| "connection lost".to_string());
+        let (session, channel) = match Self::open_channel(&self.session_info, self.cols, self.rows)
+        {
+            Ok(connection) => connection,
+            Err(err) => {
+                self.next_reconnect_at = Instant::now() + REMOTE_RECONNECT_BACKOFF;
+                return Err(err);
+            }
+        };
+
+        self.session = session;
+        self.channel = channel;
+        self.parser = Parser::new();
+        self.disconnected = false;
+        self.disconnect_reason = None;
+        self.desired_dir = reconnect_dir.clone();
+        self.next_reconnect_at = Instant::now();
+        self.last_keepalive_at = Instant::now();
+
+        self.inject_remote_cwd_hooks()?;
+        self.write_raw(shell_cd_command(&reconnect_dir).as_bytes())?;
+        self.write_raw(b"__badassh_cwd\r")?;
+
+        let message = format!(
+            "Recovered remote terminal for {}@{}",
+            self.session_info.username, self.session_info.host
+        );
+        self.append_status_message(&message);
+        info!("{} after stale connection: {}", message, reason);
+        Ok(Some(message))
+    }
+
+    fn maybe_keepalive(&mut self) -> Result<Option<String>> {
+        if self.disconnected {
+            return self.reconnect(false);
+        }
+        if self.last_keepalive_at.elapsed() < REMOTE_KEEPALIVE_INTERVAL {
+            return Ok(None);
+        }
+
+        self.last_keepalive_at = Instant::now();
+        if let Err(e) = self.session.keepalive_send() {
+            self.mark_disconnected(format!("keepalive failed: {}", e));
+            return self.reconnect(false);
+        }
+        Ok(None)
+    }
+
+    pub fn poll_read(&mut self) -> Result<Option<String>> {
+        if let Some(message) = self.maybe_keepalive()? {
+            return Ok(Some(message));
+        }
+
+        if self.disconnected {
+            return self.reconnect(false);
+        }
+
+        let mut buf = [0u8; 8192];
+        let mut reconnect_reason = None;
+
+        for _ in 0..3 {
+            {
+                let mut screen = self.screen.lock();
+                match self.channel.read(&mut buf) {
+                    Ok(0) => {
+                        if self.channel.eof() {
+                            reconnect_reason = Some("remote shell closed the PTY".to_string());
+                        }
+                    }
+                    Ok(n) => {
+                        for byte in &buf[..n] {
+                            self.parser.advance(&mut *screen, *byte);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        reconnect_reason = Some(format!("read failed: {}", e));
+                    }
+                }
+            }
+
+            if reconnect_reason.is_some() {
+                break;
+            }
+        }
+
+        self.sync_desired_dir_from_screen();
+
+        if let Some(reason) = reconnect_reason {
+            self.mark_disconnected(reason);
+            return self.reconnect(false);
+        }
+
+        Ok(None)
+    }
+
+    /// Latest absolute path reported by the remote shell via OSC 7 (see `inject_remote_cwd_hooks`).
+    pub fn try_reported_cwd(&self) -> Option<String> {
+        self.screen.lock().last_reported_cwd.clone()
+    }
+
+    pub fn write(&mut self, data: &[u8]) -> Result<()> {
+        let _ = self.poll_read()?;
+        if self.disconnected {
+            let _ = self.reconnect(true)?;
+        }
+
+        match self.write_raw(data) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.mark_disconnected(e.to_string());
+                let _ = self.reconnect(true)?;
+                self.write_raw(data)
+            }
+        }
+    }
+
     pub fn send_key(&mut self, key: &str) -> Result<()> {
         self.write(key.as_bytes())
     }
 
     pub fn set_working_dir(&mut self, dir: &str) -> Result<()> {
+        self.desired_dir = dir.to_string();
         self.write(shell_cd_command(dir).as_bytes())
     }
 
@@ -1000,8 +1141,18 @@ impl RemoteTerminal {
         self.cols = cols;
         self.rows = rows;
         self.screen.lock().resize(cols as usize, rows as usize);
-        self.channel
-            .request_pty_size(cols as u32, rows as u32, Some(0), Some(0))?;
+        if self.disconnected {
+            let _ = self.reconnect(true)?;
+        }
+        if let Err(e) = self
+            .channel
+            .request_pty_size(cols as u32, rows as u32, Some(0), Some(0))
+        {
+            self.mark_disconnected(format!("resize failed: {}", e));
+            let _ = self.reconnect(true)?;
+            self.channel
+                .request_pty_size(cols as u32, rows as u32, Some(0), Some(0))?;
+        }
         Ok(())
     }
 

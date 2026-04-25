@@ -1,13 +1,17 @@
 use anyhow::{Context, Result};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
+use parking_lot::Mutex;
 use ssh2::{Session, Sftp};
 use std::io::Read;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+const SSH_KEEPALIVE_INTERVAL_SECS: u32 = 30;
+
 pub struct SshConnection {
-    session: Session,
+    session: Mutex<Session>,
+    params: ConnectionParams,
     #[allow(dead_code)]
     pub host: String,
     #[allow(dead_code)]
@@ -25,45 +29,52 @@ pub struct ConnectionParams {
     pub key_path: Option<String>,
 }
 
+pub(crate) fn open_ssh_session(params: &ConnectionParams, blocking: bool) -> Result<Session> {
+    let addr = format!("{}:{}", params.host, params.port);
+    let tcp =
+        TcpStream::connect(&addr).with_context(|| format!("Failed to connect to {}", addr))?;
+
+    debug!("TCP connection established to {}", addr);
+
+    let mut session = Session::new().context("Failed to create SSH session")?;
+    session.set_tcp_stream(tcp);
+    session.handshake().context("SSH handshake failed")?;
+    session.set_keepalive(false, SSH_KEEPALIVE_INTERVAL_SECS);
+
+    debug!("SSH handshake completed");
+
+    if let Some(ref password) = params.password {
+        debug!("Attempting password authentication");
+        session
+            .userauth_password(&params.username, password)
+            .context("Password authentication failed")?;
+    } else if let Some(ref key_path) = params.key_path {
+        debug!("Attempting key file authentication: {}", key_path);
+        let key_path = PathBuf::from(key_path);
+        SshConnection::try_key_file(&mut session, &params.username, &key_path)?;
+    } else {
+        debug!("Attempting auto authentication (agent + default keys)");
+        SshConnection::try_auto_auth(&mut session, &params.username)?;
+    }
+
+    if !session.authenticated() {
+        error!(
+            "SSH authentication failed for {}@{}",
+            params.username, params.host
+        );
+        anyhow::bail!("Authentication failed");
+    }
+
+    session.set_blocking(blocking);
+    Ok(session)
+}
+
 impl SshConnection {
     pub fn connect(params: &ConnectionParams) -> Result<Self> {
         let addr = format!("{}:{}", params.host, params.port);
         info!("Connecting to SSH: {}@{}", params.username, addr);
 
-        let tcp =
-            TcpStream::connect(&addr).with_context(|| format!("Failed to connect to {}", addr))?;
-
-        debug!("TCP connection established");
-
-        let mut session = Session::new().context("Failed to create SSH session")?;
-
-        session.set_tcp_stream(tcp);
-        session.handshake().context("SSH handshake failed")?;
-
-        debug!("SSH handshake completed");
-
-        // Try authentication methods in order of preference
-        if let Some(ref password) = params.password {
-            debug!("Attempting password authentication");
-            session
-                .userauth_password(&params.username, password)
-                .context("Password authentication failed")?;
-        } else if let Some(ref key_path) = params.key_path {
-            debug!("Attempting key file authentication: {}", key_path);
-            let key_path = PathBuf::from(key_path);
-            Self::try_key_file(&mut session, &params.username, &key_path)?;
-        } else {
-            debug!("Attempting auto authentication (agent + default keys)");
-            Self::try_auto_auth(&mut session, &params.username)?;
-        }
-
-        if !session.authenticated() {
-            error!(
-                "SSH authentication failed for {}@{}",
-                params.username, params.host
-            );
-            anyhow::bail!("Authentication failed");
-        }
+        let session = open_ssh_session(params, true)?;
 
         info!(
             "SSH connected successfully to {}@{}",
@@ -71,7 +82,8 @@ impl SshConnection {
         );
 
         Ok(Self {
-            session,
+            session: Mutex::new(session),
+            params: params.clone(),
             host: params.host.clone(),
             port: params.port,
             username: params.username.clone(),
@@ -180,36 +192,75 @@ impl SshConnection {
         Ok(status.success())
     }
 
-    pub fn exec(&self, command: &str) -> Result<String> {
-        let mut channel = self
-            .session
-            .channel_session()
-            .context("Failed to open channel")?;
+    fn reconnect(&self) -> Result<()> {
+        info!(
+            "Reconnecting SSH session for {}@{}:{}",
+            self.params.username, self.params.host, self.params.port
+        );
+        let replacement = open_ssh_session(&self.params, true)?;
+        let mut session = self.session.lock();
+        let _ = session.disconnect(None, "Reconnecting", None);
+        *session = replacement;
+        Ok(())
+    }
 
-        channel.exec(command).context("Failed to execute command")?;
-
-        // Read both stdout and stderr
-        let mut stdout = String::new();
-        channel
-            .read_to_string(&mut stdout)
-            .context("Failed to read command stdout")?;
-
-        let mut stderr = String::new();
-        channel
-            .stderr()
-            .read_to_string(&mut stderr)
-            .context("Failed to read command stderr")?;
-
-        channel.wait_close()?;
-
-        // Combine stdout and stderr for full output
-        if stderr.is_empty() {
-            Ok(stdout)
-        } else if stdout.is_empty() {
-            Ok(stderr)
-        } else {
-            Ok(format!("{}\n{}", stdout, stderr))
+    fn with_reconnect<T, F>(&self, operation_name: &str, mut operation: F) -> Result<T>
+    where
+        F: FnMut(&Session) -> Result<T>,
+    {
+        {
+            let session = self.session.lock();
+            match operation(&session) {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    warn!(
+                        "{} failed for {}@{}:{}; attempting reconnect: {}",
+                        operation_name,
+                        self.params.username,
+                        self.params.host,
+                        self.params.port,
+                        err
+                    );
+                }
+            }
         }
+
+        self.reconnect()
+            .with_context(|| format!("{} failed and reconnect was unsuccessful", operation_name))?;
+
+        let session = self.session.lock();
+        operation(&session).with_context(|| format!("{} failed after reconnect", operation_name))
+    }
+
+    pub fn exec(&self, command: &str) -> Result<String> {
+        self.with_reconnect("SSH command execution", |session| {
+            let mut channel = session
+                .channel_session()
+                .context("Failed to open channel")?;
+
+            channel.exec(command).context("Failed to execute command")?;
+
+            let mut stdout = String::new();
+            channel
+                .read_to_string(&mut stdout)
+                .context("Failed to read command stdout")?;
+
+            let mut stderr = String::new();
+            channel
+                .stderr()
+                .read_to_string(&mut stderr)
+                .context("Failed to read command stderr")?;
+
+            channel.wait_close()?;
+
+            if stderr.is_empty() {
+                Ok(stdout)
+            } else if stdout.is_empty() {
+                Ok(stderr)
+            } else {
+                Ok(format!("{}\n{}", stdout, stderr))
+            }
+        })
     }
 
     pub fn get_remote_pwd(&self) -> Result<String> {
@@ -223,23 +274,29 @@ impl SshConnection {
 
     #[allow(dead_code)]
     pub fn is_connected(&self) -> bool {
-        self.session.authenticated()
+        self.session.lock().authenticated()
     }
 
     #[allow(dead_code)]
     pub fn disconnect(self) {
-        let _ = self.session.disconnect(None, "User disconnected", None);
+        let _ = self
+            .session
+            .lock()
+            .disconnect(None, "User disconnected", None);
     }
 
     pub fn sftp(&self) -> Result<Sftp> {
-        self.session
-            .sftp()
-            .context("Failed to create SFTP subsystem")
+        self.with_reconnect("SFTP session creation", |session| {
+            session.sftp().context("Failed to create SFTP subsystem")
+        })
     }
 }
 
 impl Drop for SshConnection {
     fn drop(&mut self) {
-        let _ = self.session.disconnect(None, "Connection closed", None);
+        let _ = self
+            .session
+            .lock()
+            .disconnect(None, "Connection closed", None);
     }
 }
