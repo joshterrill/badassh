@@ -1,19 +1,22 @@
 use crate::db::{AuthMethod, Database, SavedConnection};
 use crate::editor::{detect_default_editor, EditorManager};
-use crate::ssh::{ConnectionParams, SshConnection};
+use crate::ssh::{open_ssh_session, ConnectionParams, SshConnection};
 use crate::terminal::{LocalTerminal, RemoteTerminal};
 use crate::transfer::{
     create_zip, extract_zip_archive, list_zip_entries, ExtractConflictStrategy, SftpSessionInfo,
     TransferManager, TransferStatus,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use ssh2::Sftp;
 use std::collections::HashSet;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +237,7 @@ pub enum ConnectMenuItem {
     NewConnection,
     RecentConnections,
     ShowAllConnections,
+    Disconnect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,6 +382,56 @@ pub struct PendingExtractOperation {
 pub enum PendingDeleteOperation {
     Files(Vec<(String, bool)>),
     SavedConnection(SavedConnection),
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteZipProgressSnapshot {
+    pub total_count: usize,
+    pub total_entries: u64,
+    pub entries_processed: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteZipJob {
+    id: usize,
+    tab_id: usize,
+    session_info: SftpSessionInfo,
+    current_dir: String,
+    zip_name: String,
+    should_download: bool,
+    local_dir: Option<String>,
+    status: RemoteZipStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteZipStatus {
+    Pending,
+    InProgress {
+        entries_processed: u64,
+        total_entries: u64,
+    },
+    Completed,
+    Failed(String),
+}
+
+#[derive(Debug)]
+enum RemoteZipEvent {
+    Started {
+        id: usize,
+        total_entries: u64,
+    },
+    Progress {
+        id: usize,
+        entries_processed: u64,
+        total_entries: u64,
+    },
+    Completed {
+        id: usize,
+    },
+    Failed {
+        id: usize,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1272,6 +1326,10 @@ pub struct App {
     pub local_terminal: Option<LocalTerminal>,
     pub local_terminal_visible: bool,
     pub terminal_focus: TerminalFocus,
+    remote_zip_jobs: Vec<RemoteZipJob>,
+    remote_zip_event_tx: Sender<RemoteZipEvent>,
+    remote_zip_event_rx: Receiver<RemoteZipEvent>,
+    next_remote_zip_job_id: usize,
     keyboard_shortcuts_return_state: Option<KeyboardShortcutsReturnState>,
 }
 
@@ -1297,6 +1355,7 @@ impl App {
         let default_editor = detect_default_editor();
         let preferences = UserPreferences::load_from_db(&db, &default_editor)?;
         let local = LocalBrowser::new(preferences.explorer_sort)?;
+        let (remote_zip_event_tx, remote_zip_event_rx) = mpsc::channel();
 
         let parallel_transfers = std::thread::available_parallelism()
             .map(|parallelism| parallelism.get().clamp(4, 8))
@@ -1350,6 +1409,10 @@ impl App {
             local_terminal: None,
             local_terminal_visible: false,
             terminal_focus: TerminalFocus::None,
+            remote_zip_jobs: Vec::new(),
+            remote_zip_event_tx,
+            remote_zip_event_rx,
+            next_remote_zip_job_id: 1,
             keyboard_shortcuts_return_state: None,
         })
     }
@@ -1398,6 +1461,7 @@ impl App {
 
     pub fn open_dropdown(&mut self) {
         if self.mode == AppMode::MenuFocused {
+            self.clamp_menu_indices();
             self.mode = AppMode::MenuOpen;
         }
     }
@@ -1432,7 +1496,7 @@ impl App {
                 self.file_menu_index = (self.file_menu_index + 1) % 2;
             }
             MenuTab::Connect => {
-                self.connect_menu_index = (self.connect_menu_index + 1) % 3;
+                self.connect_menu_index = (self.connect_menu_index + 1) % self.connect_menu_len();
             }
             MenuTab::Help => {
                 self.help_menu_index = 0;
@@ -1446,8 +1510,9 @@ impl App {
                 self.file_menu_index = if self.file_menu_index == 0 { 1 } else { 0 };
             }
             MenuTab::Connect => {
+                let last = self.connect_menu_len().saturating_sub(1);
                 self.connect_menu_index = if self.connect_menu_index == 0 {
-                    2
+                    last
                 } else {
                     self.connect_menu_index - 1
                 };
@@ -1482,12 +1547,41 @@ impl App {
                     self.refresh_connections();
                     self.mode = AppMode::ConnectionList;
                 }
+                3 if !self.tabs.is_empty() => {
+                    self.disconnect_current();
+                }
                 _ => {}
             },
             MenuTab::Help => {
                 self.open_keyboard_shortcuts();
             }
         }
+    }
+
+    pub fn connect_menu_items(&self) -> Vec<&'static str> {
+        let mut items = vec![
+            "New Connection",
+            "Recent Connections",
+            "Show All Connections",
+        ];
+        if !self.tabs.is_empty() {
+            items.push("Disconnect");
+        }
+        items
+    }
+
+    fn connect_menu_len(&self) -> usize {
+        if self.tabs.is_empty() {
+            3
+        } else {
+            4
+        }
+    }
+
+    fn clamp_menu_indices(&mut self) {
+        self.connect_menu_index = self
+            .connect_menu_index
+            .min(self.connect_menu_len().saturating_sub(1));
     }
 
     pub fn can_open_keyboard_shortcuts(&self) -> bool {
@@ -2042,27 +2136,37 @@ impl App {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn disconnect_current(&mut self) {
         if self.tabs.is_empty() {
             return;
         }
 
+        self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         let tab = self.tabs.remove(self.active_tab);
+        let tab_name = tab.name.clone();
         tab.connection.disconnect();
+
+        if self.terminal_focus == TerminalFocus::RemoteTerminal {
+            self.terminal_focus = TerminalFocus::None;
+        }
 
         if self.tabs.is_empty() {
             self.active_tab = 0;
+            self.tab_bar_highlight = 0;
             self.mode = AppMode::Normal;
             self.focus = FocusPanel::Local;
-            self.status_message = Some("Disconnected".to_string());
         } else {
             self.active_tab = self.active_tab.min(self.tabs.len() - 1);
-            self.tab_bar_highlight = self.tab_bar_highlight.min(self.tabs.len() - 1);
+            self.tab_bar_highlight = self.active_tab;
             if self.tabs.len() <= 1 && self.focus == FocusPanel::ConnectionTabs {
-                self.focus = FocusPanel::Local;
+                self.focus = FocusPanel::Remote;
             }
+            self.mode = AppMode::Connected;
         }
+
+        self.connect_menu_index = 0;
+        self.status_message = Some(format!("Disconnected from {}", tab_name));
+        self.error_message = None;
     }
 
     pub fn current_tab(&self) -> Option<&ConnectionTab> {
@@ -2654,6 +2758,146 @@ impl App {
         self.transfer_manager.clear_completed();
     }
 
+    pub fn poll_remote_zip_jobs(&mut self) {
+        while let Ok(event) = self.remote_zip_event_rx.try_recv() {
+            match event {
+                RemoteZipEvent::Started { id, total_entries } => {
+                    if let Some(job) = self.remote_zip_jobs.iter_mut().find(|job| job.id == id) {
+                        job.status = RemoteZipStatus::InProgress {
+                            entries_processed: 0,
+                            total_entries,
+                        };
+                    }
+                }
+                RemoteZipEvent::Progress {
+                    id,
+                    entries_processed,
+                    total_entries,
+                } => {
+                    if let Some(job) = self.remote_zip_jobs.iter_mut().find(|job| job.id == id) {
+                        job.status = RemoteZipStatus::InProgress {
+                            entries_processed,
+                            total_entries,
+                        };
+                    }
+                }
+                RemoteZipEvent::Completed { id } => {
+                    if let Some(job) = self.remote_zip_jobs.iter_mut().find(|job| job.id == id) {
+                        job.status = RemoteZipStatus::Completed;
+                    }
+                    self.finish_remote_zip_job(id);
+                }
+                RemoteZipEvent::Failed { id, error } => {
+                    error!("Remote zip #{} failed: {}", id, error);
+                    if let Some(job) = self.remote_zip_jobs.iter_mut().find(|job| job.id == id) {
+                        job.status = RemoteZipStatus::Failed(error.clone());
+                    }
+                    self.status_message = None;
+                    self.error_message = Some(format!("Zip failed: {}", error));
+                }
+            }
+        }
+
+        self.remote_zip_jobs.retain(|job| {
+            !matches!(
+                job.status,
+                RemoteZipStatus::Completed | RemoteZipStatus::Failed(_)
+            )
+        });
+    }
+
+    pub fn remote_zip_progress(&self) -> Option<RemoteZipProgressSnapshot> {
+        let mut total_count = 0_usize;
+        let mut total_entries = 0_u64;
+        let mut entries_processed = 0_u64;
+
+        for job in &self.remote_zip_jobs {
+            match job.status {
+                RemoteZipStatus::Pending => {
+                    total_count += 1;
+                }
+                RemoteZipStatus::InProgress {
+                    entries_processed: job_processed,
+                    total_entries: job_total,
+                } => {
+                    total_count += 1;
+                    total_entries += job_total;
+                    entries_processed += job_processed;
+                }
+                RemoteZipStatus::Completed | RemoteZipStatus::Failed(_) => {}
+            }
+        }
+
+        if total_count == 0 {
+            None
+        } else {
+            Some(RemoteZipProgressSnapshot {
+                total_count,
+                total_entries,
+                entries_processed,
+            })
+        }
+    }
+
+    fn finish_remote_zip_job(&mut self, id: usize) {
+        let Some(job) = self
+            .remote_zip_jobs
+            .iter()
+            .find(|job| job.id == id)
+            .cloned()
+        else {
+            return;
+        };
+
+        info!("Remote zip #{} completed: {}", id, job.zip_name);
+
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == job.tab_id) {
+            if tab.browser.current_dir == job.current_dir {
+                if let Err(e) = tab.refresh_directory() {
+                    warn!("Failed to refresh remote directory after zip: {}", e);
+                }
+
+                if let Some(idx) = tab
+                    .browser
+                    .files
+                    .iter()
+                    .position(|file| file.name == job.zip_name)
+                {
+                    tab.browser.selected_index = idx;
+                    tab.browser.selected_indices.insert(idx);
+                }
+            }
+        }
+
+        if job.should_download {
+            let local_dir = job
+                .local_dir
+                .clone()
+                .unwrap_or_else(|| self.local.browser.current_dir.clone());
+            let remote_path = format!("{}/{}", job.current_dir.trim_end_matches('/'), job.zip_name);
+            let dest_path = PathBuf::from(&local_dir)
+                .join(&job.zip_name)
+                .to_string_lossy()
+                .to_string();
+
+            self.transfer_manager.queue_download_to_path(
+                job.session_info,
+                remote_path,
+                dest_path,
+                false,
+                None,
+            );
+            self.status_message = Some(format!(
+                "Zipped {} -> download queued to {}",
+                job.zip_name, local_dir
+            ));
+        } else {
+            self.status_message = Some(format!("Created {}", job.zip_name));
+        }
+
+        self.error_message = None;
+    }
+
     pub fn update_local_watcher(&mut self) {
         let dir = PathBuf::from(&self.local.browser.current_dir);
         if let Err(e) = self.editor_manager.watch_local_directory(&dir) {
@@ -3090,7 +3334,7 @@ impl App {
     }
 
     fn zip_remote_files(&mut self) {
-        let (files, current_dir) = if let Some(tab) = self.current_tab() {
+        let (files, current_dir, tab_id, session_info) = if let Some(tab) = self.current_tab() {
             let files: Vec<String> = tab
                 .browser
                 .get_selected_files()
@@ -3098,7 +3342,12 @@ impl App {
                 .filter(|f| f.name != "..")
                 .map(|f| f.name.clone())
                 .collect();
-            (files, tab.browser.current_dir.clone())
+            (
+                files,
+                tab.browser.current_dir.clone(),
+                tab.id,
+                tab.session_info.clone(),
+            )
         } else {
             self.zip_awaiting_second_press = None;
             self.pending_zip_transfer = false;
@@ -3120,76 +3369,223 @@ impl App {
             )
         };
 
+        let should_download = self.pending_zip_transfer;
+        self.pending_zip_transfer = false;
+        let local_dir = should_download.then(|| self.local.browser.current_dir.clone());
+
+        if let Some(tab) = self.current_tab_mut() {
+            tab.browser.clear_selection();
+        }
+
+        self.queue_remote_zip(
+            tab_id,
+            session_info,
+            current_dir,
+            files,
+            zip_name,
+            should_download,
+            local_dir,
+        );
+    }
+
+    fn queue_remote_zip(
+        &mut self,
+        tab_id: usize,
+        session_info: SftpSessionInfo,
+        current_dir: String,
+        files: Vec<String>,
+        zip_name: String,
+        should_download: bool,
+        local_dir: Option<String>,
+    ) {
+        let id = self.next_remote_zip_job_id;
+        self.next_remote_zip_job_id += 1;
+
+        let command = Self::build_remote_zip_command(&current_dir, &zip_name, &files);
+        info!("Queuing remote zip #{} with command: {}", id, command);
+
+        self.remote_zip_jobs.push(RemoteZipJob {
+            id,
+            tab_id,
+            session_info: session_info.clone(),
+            current_dir,
+            zip_name: zip_name.clone(),
+            should_download,
+            local_dir,
+            status: RemoteZipStatus::Pending,
+        });
+
+        let tx = self.remote_zip_event_tx.clone();
+        thread::spawn(move || {
+            if let Err(e) = Self::run_remote_zip_command(tx.clone(), id, session_info, command) {
+                let _ = tx.send(RemoteZipEvent::Failed {
+                    id,
+                    error: e.to_string(),
+                });
+            }
+        });
+
+        self.status_message = Some(format!("Zipping {} item(s) on remote", files.len()));
+        self.error_message = None;
+    }
+
+    fn build_remote_zip_command(current_dir: &str, zip_name: &str, files: &[String]) -> String {
         let files_arg = files
             .iter()
-            .map(|f| format!("\"{}\"", f))
+            .map(|f| Self::shell_quote(f))
             .collect::<Vec<_>>()
             .join(" ");
 
-        let cmd = format!(
-            "cd \"{}\" && zip -r \"{}\" {} 2>&1",
-            current_dir, zip_name, files_arg
-        );
-        info!("Creating remote zip with command: {}", cmd);
+        let mut total_command = String::from("{ ");
+        for file in files {
+            let quoted = Self::shell_quote(file);
+            total_command.push_str(&format!(
+                "if [ -d {path} ]; then find {path} -print 2>/dev/null; elif [ -e {path} ]; then printf '%s\\n' {path}; fi; ",
+                path = quoted
+            ));
+        }
+        total_command.push('}');
 
-        let should_download = self.pending_zip_transfer;
-        self.pending_zip_transfer = false;
+        format!(
+            "{{ cd {dir} && total=$({total_command} | wc -l | tr -d '[:space:]'); printf '__BADASSH_ZIP_TOTAL__%s\\n' \"$total\"; zip -r {zip_name} {files_arg} 2>&1; }} 2>&1",
+            dir = Self::shell_quote(current_dir),
+            total_command = total_command,
+            zip_name = Self::shell_quote(zip_name),
+            files_arg = files_arg,
+        )
+    }
 
-        let result = if let Some(tab) = self.current_tab_mut() {
-            tab.browser.clear_selection();
-            tab.connection.exec(&cmd)
-        } else {
-            return;
+    fn run_remote_zip_command(
+        tx: Sender<RemoteZipEvent>,
+        id: usize,
+        session_info: SftpSessionInfo,
+        command: String,
+    ) -> Result<()> {
+        let params = ConnectionParams {
+            host: session_info.host,
+            port: session_info.port,
+            username: session_info.username,
+            password: session_info.password,
+            key_path: session_info.key_path,
         };
 
-        let mut success = false;
+        let session = open_ssh_session(&params, true)?;
+        let mut channel = session
+            .channel_session()
+            .context("Failed to open remote zip channel")?;
+        channel
+            .exec(&command)
+            .context("Failed to start remote zip command")?;
 
-        match result {
-            Ok(output) => {
-                info!("Remote zip output: {}", output);
+        let mut buffer = [0_u8; 8192];
+        let mut pending = String::new();
+        let mut total_entries = 0_u64;
+        let mut entries_processed = 0_u64;
+        let mut output_tail = String::new();
+        let mut last_progress_sent = Instant::now();
 
-                let lower = output.to_lowercase();
-                let is_error = lower.contains("command not found")
-                    || lower.contains("zip: not found")
-                    || lower.contains("no such file")
-                    || lower.contains("permission denied")
-                    || (lower.contains("zip error") || lower.contains("zip: error"));
-
-                if is_error {
-                    warn!("Remote zip failed: {}", output);
-                    self.error_message = Some(output.trim().to_string());
-                } else {
-                    info!("Remote zip created successfully: {}", zip_name);
-                    self.error_message = None;
-                    success = true;
-                }
+        loop {
+            let bytes_read = channel
+                .read(&mut buffer)
+                .context("Failed to read remote zip output")?;
+            if bytes_read == 0 {
+                break;
             }
-            Err(e) => {
-                error!("Remote zip command failed: {}", e);
-                self.error_message = Some(format!("Zip failed: {}", e));
+
+            pending.push_str(&String::from_utf8_lossy(&buffer[..bytes_read]));
+            while let Some(pos) = pending.find('\n') {
+                let line = pending[..pos].to_string();
+                let rest = pending[pos + 1..].to_string();
+                pending = rest;
+                Self::handle_remote_zip_output_line(
+                    &line,
+                    &tx,
+                    id,
+                    &mut total_entries,
+                    &mut entries_processed,
+                    &mut output_tail,
+                    &mut last_progress_sent,
+                );
             }
         }
 
-        if let Some(tab) = self.current_tab_mut() {
-            let _ = tab.refresh_directory();
+        if !pending.is_empty() {
+            Self::handle_remote_zip_output_line(
+                &pending,
+                &tx,
+                id,
+                &mut total_entries,
+                &mut entries_processed,
+                &mut output_tail,
+                &mut last_progress_sent,
+            );
+        }
 
-            if success {
-                if let Some(idx) = tab.browser.files.iter().position(|f| f.name == zip_name) {
-                    tab.browser.selected_index = idx;
-                    tab.browser.selected_indices.insert(idx);
-                }
+        channel
+            .wait_close()
+            .context("Failed to close remote zip channel")?;
+        let exit_status = channel.exit_status().unwrap_or(1);
+
+        if exit_status == 0 {
+            let _ = tx.send(RemoteZipEvent::Completed { id });
+            Ok(())
+        } else {
+            let message = if output_tail.trim().is_empty() {
+                format!("remote zip exited with status {}", exit_status)
+            } else {
+                output_tail.trim().to_string()
+            };
+            anyhow::bail!(message)
+        }
+    }
+
+    fn handle_remote_zip_output_line(
+        line: &str,
+        tx: &Sender<RemoteZipEvent>,
+        id: usize,
+        total_entries: &mut u64,
+        entries_processed: &mut u64,
+        output_tail: &mut String,
+        last_progress_sent: &mut Instant,
+    ) {
+        const TOTAL_MARKER: &str = "__BADASSH_ZIP_TOTAL__";
+
+        let line = line.trim_end_matches('\r');
+        if let Some(value) = line.strip_prefix(TOTAL_MARKER) {
+            *total_entries = value.trim().parse::<u64>().unwrap_or(0);
+            let _ = tx.send(RemoteZipEvent::Started {
+                id,
+                total_entries: *total_entries,
+            });
+            return;
+        }
+
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("adding:")
+            || trimmed.starts_with("updating:")
+            || trimmed.starts_with("freshening:")
+        {
+            *entries_processed += 1;
+            let effective_total = (*total_entries).max(*entries_processed);
+            if last_progress_sent.elapsed() >= Duration::from_millis(100)
+                || *entries_processed >= effective_total
+            {
+                let _ = tx.send(RemoteZipEvent::Progress {
+                    id,
+                    entries_processed: *entries_processed,
+                    total_entries: effective_total,
+                });
+                *last_progress_sent = Instant::now();
             }
         }
 
-        if success && should_download {
-            let local_dir = self.local.browser.current_dir.clone();
-            self.download_selected();
-            self.status_message = Some(format!(
-                "Zipped {} → download queued to {}",
-                zip_name, local_dir
-            ));
-        } else if success {
-            self.status_message = Some(format!("Created {}", zip_name));
+        if !trimmed.is_empty() {
+            output_tail.push_str(trimmed);
+            output_tail.push('\n');
+            if output_tail.len() > 4000 {
+                let keep_from = output_tail.len().saturating_sub(4000);
+                output_tail.drain(..keep_from);
+            }
         }
     }
 

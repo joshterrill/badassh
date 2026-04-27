@@ -83,6 +83,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App)
     while app.running {
         terminal.draw(|f| ui::draw(f, app))?;
         app.check_transfers_and_refresh();
+        app.poll_remote_zip_jobs();
         app.check_local_directory_changes();
         app.process_editor_uploads();
         app.poll_remote_terminals();

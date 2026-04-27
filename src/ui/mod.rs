@@ -1,6 +1,7 @@
 use crate::app::{
     App, AppMode, DialogField, ExplorerColumns, FileBrowser, FilterMode, FocusPanel, MenuTab,
-    PendingDeleteOperation, TerminalFocus, SETTINGS_ROW_COUNT, SETTINGS_ROW_EDITOR,
+    PendingDeleteOperation, RemoteZipProgressSnapshot, TerminalFocus, SETTINGS_ROW_COUNT,
+    SETTINGS_ROW_EDITOR,
 };
 use crate::transfer::TransferProgressSnapshot;
 use ratatui::{
@@ -176,11 +177,10 @@ fn draw_dropdown_menu(frame: &mut Frame, app: &App) {
             app.file_menu_index,
         ),
         MenuTab::Connect => (
-            vec![
-                "New Connection".to_string(),
-                "Recent Connections".to_string(),
-                "Show All Connections".to_string(),
-            ],
+            app.connect_menu_items()
+                .into_iter()
+                .map(|item| item.to_string())
+                .collect(),
             8,
             app.connect_menu_index,
         ),
@@ -1660,7 +1660,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" Ready ", Style::default().fg(ACCENT))
     };
 
-    let transfer_status = if let Some(progress) = app.transfer_manager.transfer_progress() {
+    let transfer_status = if let Some(progress) = app.remote_zip_progress() {
+        Some(render_zip_progress(progress, area.width))
+    } else if let Some(progress) = app.transfer_manager.transfer_progress() {
         Some(render_transfer_progress(progress, area.width))
     } else {
         let items = app.transfer_manager.get_items();
@@ -1752,6 +1754,38 @@ fn render_transfer_progress(progress: TransferProgressSnapshot, available_width:
         progress.bytes_transferred as f64 / progress.total_bytes as f64
     } else if progress.total_count > 0 {
         progress.completed_count as f64 / progress.total_count as f64
+    } else {
+        0.0
+    }
+    .clamp(0.0, 1.0);
+
+    let percent = format!(" {:>3.0}% ", ratio * 100.0);
+    let min_bar_width = 8usize;
+    let preferred_bar_width = 18usize;
+    let max_width = available_width.saturating_sub(12) as usize;
+    let fixed_width = label.len() + percent.len() + 2;
+
+    if max_width <= fixed_width + min_bar_width {
+        return format!("{}{}", label, percent);
+    }
+
+    let bar_width = preferred_bar_width.min(max_width.saturating_sub(fixed_width));
+    let filled = ((bar_width as f64) * ratio).round() as usize;
+    let empty = bar_width.saturating_sub(filled);
+    let bar = format!("[{}{}]", "=".repeat(filled), " ".repeat(empty));
+
+    format!("{}{}{}", label, bar, percent)
+}
+
+fn render_zip_progress(progress: RemoteZipProgressSnapshot, available_width: u16) -> String {
+    let label = if progress.total_count == 1 {
+        " 1 zip ".to_string()
+    } else {
+        format!(" {} zips ", progress.total_count)
+    };
+
+    let ratio = if progress.total_entries > 0 {
+        progress.entries_processed as f64 / progress.total_entries as f64
     } else {
         0.0
     }
